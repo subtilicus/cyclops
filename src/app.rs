@@ -67,7 +67,11 @@ pub struct CyclopsApp {
     special: HashSet<PathBuf>,
     /// Servers and share roots the user has visited (persisted).
     network_places: Vec<PathBuf>,
-    expanded: HashSet<PathBuf>,
+    /// Expanded tree nodes, keyed by (top-level root, path): the same folder can appear under
+    /// several roots (e.g. Pictures and C:\Users\…\Pictures) and each branch is independent.
+    expanded: HashSet<(PathBuf, PathBuf)>,
+    /// The top-level tree root the current folder is being browsed under.
+    tree_root: Option<PathBuf>,
     scroll_tree_to_folder: bool,
 
     folder: Option<PathBuf>,
@@ -125,6 +129,7 @@ impl CyclopsApp {
                 .map(|s| s.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
                 .unwrap_or_default(),
             expanded: HashSet::new(),
+            tree_root: None,
             scroll_tree_to_folder: true,
             folder: None,
             path_edit: String::new(),
@@ -221,10 +226,22 @@ impl CyclopsApp {
         if !self.entries.is_empty() {
             self.selected = Some(0);
         }
-        let mut ancestor = fs::parent(&folder);
-        while let Some(a) = ancestor {
-            ancestor = fs::parent(&a);
-            self.expanded.insert(a);
+        // Stay in the branch the user is browsing; otherwise pick the most specific root.
+        if !self.tree_root.as_deref().is_some_and(|r| under_root(&folder, r)) {
+            self.tree_root = self
+                .roots
+                .iter()
+                .map(|(_, r)| r)
+                .filter(|r| under_root(&folder, r))
+                .max_by_key(|r| r.as_os_str().len())
+                .cloned();
+        }
+        if let Some(root) = self.tree_root.clone() {
+            let mut ancestor = fs::parent(&folder);
+            while let Some(a) = ancestor.filter(|a| under_root(a, &root)) {
+                ancestor = fs::parent(&a);
+                self.expanded.insert((root.clone(), a));
+            }
         }
         self.path_edit = if fs::location(&folder) == fs::Location::Network {
             "Network".to_owned()
@@ -549,15 +566,16 @@ impl CyclopsApp {
             ui.spacing_mut().item_spacing.y = 1.0;
             let roots = self.roots.clone();
             for (label, path) in &roots {
-                self.tree_node(ui, path, label, 0);
+                self.tree_node(ui, path, path, label, 0);
             }
         });
         self.scroll_tree_to_folder = false;
     }
 
-    fn tree_node(&mut self, ui: &mut egui::Ui, path: &Path, label: &str, depth: usize) {
-        let expanded = self.expanded.contains(path);
-        let is_current = self.folder.as_deref() == Some(path);
+    fn tree_node(&mut self, ui: &mut egui::Ui, root: &Path, path: &Path, label: &str, depth: usize) {
+        let key = (root.to_path_buf(), path.to_path_buf());
+        let expanded = self.expanded.contains(&key);
+        let is_current = self.folder.as_deref() == Some(path) && self.tree_root.as_deref() == Some(root);
 
         let row_h = 24.0;
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(120.0), row_h), Sense::click());
@@ -590,21 +608,22 @@ impl CyclopsApp {
 
         if resp.clicked() && on_chevron || resp.double_clicked() {
             if expanded {
-                self.expanded.remove(path);
+                self.expanded.remove(&key);
             } else {
-                self.expanded.insert(path.to_path_buf());
+                self.expanded.insert(key.clone());
             }
         } else if resp.clicked() {
+            self.tree_root = Some(root.to_path_buf());
             self.navigate(path.to_path_buf());
         }
         if is_current && self.scroll_tree_to_folder {
             resp.scroll_to_me(Some(egui::Align::Center));
         }
-        if self.expanded.contains(path) {
+        if self.expanded.contains(&key) {
             match self.children(path) {
                 Some(children) => {
                     for child in &children {
-                        self.tree_node(ui, child, &fs::display_name(child), depth + 1);
+                        self.tree_node(ui, root, child, &fs::display_name(child), depth + 1);
                     }
                 }
                 None => {
@@ -1071,6 +1090,15 @@ impl CyclopsApp {
         );
         painter.rect(pill, CornerRadius::same(255), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
         painter.galley(pill.min + vec2(14.0, 7.0), galley, theme::TEXT);
+    }
+}
+
+/// Whether `folder` lives in the tree branch below `root`.
+fn under_root(folder: &Path, root: &Path) -> bool {
+    if fs::location(root) == fs::Location::Network {
+        fs::is_remote(folder)
+    } else {
+        folder.starts_with(root)
     }
 }
 
