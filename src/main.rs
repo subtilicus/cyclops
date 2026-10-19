@@ -5,6 +5,7 @@ mod decode;
 mod fs;
 mod icons;
 mod loader;
+mod shell;
 mod theme;
 
 use std::path::PathBuf;

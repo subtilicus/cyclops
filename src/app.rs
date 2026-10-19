@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
     Align2, Color32, CornerRadius, FontId, Key, Rect, Sense, Stroke, TextFormat, TextureHandle, TextureOptions,
@@ -10,6 +11,7 @@ use egui::{
 use crate::fs::{self, Entry, SortKey};
 use crate::icons::{self, Icon};
 use crate::loader::{Kind, Loader};
+use crate::shell::{self, IconLoader};
 use crate::theme;
 
 /// Thumbnails are decoded at this size and scaled on the GPU for display.
@@ -52,8 +54,19 @@ struct Viewer {
 
 pub struct CyclopsApp {
     loader: Loader,
+    ctx: egui::Context,
     roots: Vec<(String, PathBuf)>,
     tree_children: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Remote folders whose children are being enumerated on a background thread.
+    children_loading: HashSet<PathBuf>,
+    children_tx: Sender<(PathBuf, Vec<PathBuf>)>,
+    children_rx: Receiver<(PathBuf, Vec<PathBuf>)>,
+    /// Native shell icons for special folders, drives and network locations (None = pending/failed).
+    icon_loader: IconLoader,
+    shell_icons: HashMap<(PathBuf, u32), Option<TextureHandle>>,
+    special: HashSet<PathBuf>,
+    /// Servers and share roots the user has visited (persisted).
+    network_places: Vec<PathBuf>,
     expanded: HashSet<PathBuf>,
     scroll_tree_to_folder: bool,
 
@@ -92,13 +105,25 @@ impl CyclopsApp {
         let thumb_size = stored("thumb_size").and_then(|s| s.parse().ok()).unwrap_or(160.0);
         let sort_key = stored("sort_key").and_then(|s| SortKey::from_label(&s)).unwrap_or(SortKey::Name);
         let sort_desc = stored("sort_desc").is_some_and(|s| s == "true");
-        let last_folder = stored("last_folder").map(PathBuf::from).filter(|p| p.is_dir());
+        let last_folder = stored("last_folder").map(PathBuf::from).filter(|p| p.is_dir() || fs::is_virtual(p));
 
         let roots = fs::roots();
+        let special = roots.iter().map(|(_, p)| p.clone()).collect();
+        let (children_tx, children_rx) = unbounded();
         let mut app = Self {
             loader: Loader::new(cc.egui_ctx.clone()),
+            ctx: cc.egui_ctx.clone(),
             roots,
             tree_children: HashMap::new(),
+            children_loading: HashSet::new(),
+            children_tx,
+            children_rx,
+            icon_loader: IconLoader::new(cc.egui_ctx.clone()),
+            shell_icons: HashMap::new(),
+            special,
+            network_places: stored("network_places")
+                .map(|s| s.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+                .unwrap_or_default(),
             expanded: HashSet::new(),
             scroll_tree_to_folder: true,
             folder: None,
@@ -134,9 +159,10 @@ impl CyclopsApp {
                     }
                 }
             }
-            Some(p) if p.is_dir() => app.navigate(p),
+            Some(p) if p.is_dir() || fs::is_virtual(&p) => app.navigate(p),
             _ => {
-                let fallback = app.roots.first().map(|(_, p)| p.clone());
+                let pictures = app.roots.iter().find(|(l, _)| l == "Pictures");
+                let fallback = pictures.or(app.roots.first()).map(|(_, p)| p.clone());
                 if let Some(p) = last_folder.or(fallback) {
                     app.navigate(p);
                 }
@@ -158,11 +184,30 @@ impl CyclopsApp {
     }
 
     fn load_folder(&mut self, folder: PathBuf) {
+        // Share roots always carry a trailing separator, matching what `Path::parent` yields.
+        let folder = match fs::location(&folder) {
+            fs::Location::ShareRoot if !folder.to_string_lossy().ends_with('\\') => {
+                PathBuf::from(format!("{}\\", folder.display()))
+            }
+            _ => folder,
+        };
+        let mut place = Some(folder.clone());
+        while let Some(p) = place {
+            if matches!(fs::location(&p), fs::Location::Server | fs::Location::ShareRoot) && !self.network_places.contains(&p) {
+                self.network_places.push(p.clone());
+            }
+            place = fs::parent(&p);
+        }
         self.loader.new_generation();
         self.thumbs.clear();
         self.viewer = None;
         self.selected = None;
-        match fs::list(&folder) {
+        let listing = if fs::is_virtual(&folder) {
+            Ok(self.children(&folder).unwrap_or_default().into_iter().map(fs::dir_entry).collect())
+        } else {
+            fs::list(&folder)
+        };
+        match listing {
             Ok(mut entries) => {
                 fs::sort(&mut entries, self.sort_key, self.sort_desc);
                 self.entries = entries;
@@ -176,10 +221,16 @@ impl CyclopsApp {
         if !self.entries.is_empty() {
             self.selected = Some(0);
         }
-        for ancestor in folder.ancestors().skip(1) {
-            self.expanded.insert(ancestor.to_path_buf());
+        let mut ancestor = fs::parent(&folder);
+        while let Some(a) = ancestor {
+            ancestor = fs::parent(&a);
+            self.expanded.insert(a);
         }
-        self.path_edit = folder.display().to_string();
+        self.path_edit = if fs::location(&folder) == fs::Location::Network {
+            "Network".to_owned()
+        } else {
+            folder.display().to_string()
+        };
         self.folder = Some(folder);
         self.scroll_tree_to_folder = true;
         self.scroll_to_selected = true;
@@ -193,10 +244,73 @@ impl CyclopsApp {
         self.scroll_to_selected = true;
     }
 
+    fn refresh(&mut self) {
+        if let Some(f) = self.folder.clone() {
+            self.tree_children.remove(&f);
+            self.load_folder(f);
+        }
+    }
+
+    /// Subfolders of `path` for the tree. Local folders are listed inline; network
+    /// locations are enumerated in the background and return `None` until ready.
+    fn children(&mut self, path: &Path) -> Option<Vec<PathBuf>> {
+        let mut children = self.children_raw(path)?;
+        // Servers and shares reached by typing a path are often not advertised (e.g. hidden
+        // shares, discovery off), so remembered ones are merged in.
+        let mut added = false;
+        for place in &self.network_places {
+            if fs::parent(place).as_deref() == Some(path) && !children.contains(place) {
+                children.push(place.clone());
+                added = true;
+            }
+        }
+        if added {
+            children.sort_by(|a, b| fs::natural_cmp(&fs::display_name(a), &fs::display_name(b)));
+        }
+        Some(children)
+    }
+
+    fn children_raw(&mut self, path: &Path) -> Option<Vec<PathBuf>> {
+        if let Some(c) = self.tree_children.get(path) {
+            return Some(c.clone());
+        }
+        if !fs::is_remote(path) {
+            let c = fs::subdirs(path);
+            self.tree_children.insert(path.to_path_buf(), c.clone());
+            return Some(c);
+        }
+        if self.children_loading.insert(path.to_path_buf()) {
+            let (tx, ctx, path) = (self.children_tx.clone(), self.ctx.clone(), path.to_path_buf());
+            std::thread::spawn(move || {
+                let kids = fs::subdirs_any(&path);
+                let _ = tx.send((path, kids));
+                ctx.request_repaint();
+            });
+        }
+        None
+    }
+
+    fn shell_icon(&mut self, path: &Path, px: u32) -> Option<egui::TextureId> {
+        let wanted = self.special.contains(path)
+            || matches!(fs::location(path), fs::Location::Network | fs::Location::Server | fs::Location::ShareRoot);
+        if !wanted {
+            return None;
+        }
+        let key = (path.to_path_buf(), px);
+        match self.shell_icons.get(&key) {
+            Some(tex) => tex.as_ref().map(|t| t.id()),
+            None => {
+                self.shell_icons.insert(key, None);
+                self.icon_loader.request(path.to_path_buf(), px);
+                None
+            }
+        }
+    }
+
     fn go_up(&mut self) {
         let Some(folder) = self.folder.clone() else { return };
-        if let Some(parent) = folder.parent() {
-            self.navigate(parent.to_path_buf());
+        if let Some(parent) = fs::parent(&folder) {
+            self.navigate(parent);
             if let Some(i) = self.entries.iter().position(|e| e.path == folder) {
                 self.selected = Some(i);
             }
@@ -258,6 +372,23 @@ impl CyclopsApp {
     // ------------------------------------------------------------------ loading
 
     fn receive(&mut self, ctx: &egui::Context) {
+        let arrived: Vec<_> = self.children_rx.try_iter().collect();
+        for (path, kids) in arrived {
+            self.children_loading.remove(&path);
+            self.tree_children.insert(path.clone(), kids);
+            if self.folder.as_ref() == Some(&path) && fs::is_virtual(&path) {
+                let selected = self.selected.and_then(|i| self.entries.get(i)).map(|e| e.path.clone());
+                self.load_folder(path);
+                if let Some(i) = selected.and_then(|p| self.entries.iter().position(|e| e.path == p)) {
+                    self.selected = Some(i);
+                }
+            }
+        }
+        for (path, px, image) in self.icon_loader.poll() {
+            let tex = image.map(|img| ctx.load_texture(format!("icon:{}:{px}", path.display()), img, TextureOptions::LINEAR));
+            self.shell_icons.insert((path, px), tex);
+        }
+
         for loaded in self.loader.poll() {
             let name = loaded.path.display().to_string();
             match loaded.kind {
@@ -362,14 +493,12 @@ impl CyclopsApp {
             if icons::button(ui, Icon::Back, !self.history.is_empty(), "Back (Alt+←)").clicked() {
                 self.go_back();
             }
-            let can_go_up = self.folder.as_deref().and_then(Path::parent).is_some();
+            let can_go_up = self.folder.as_deref().and_then(fs::parent).is_some();
             if icons::button(ui, Icon::Up, can_go_up, "Up (Backspace)").clicked() {
                 self.go_up();
             }
             if icons::button(ui, Icon::Refresh, true, "Refresh (F5)").clicked() {
-                if let Some(f) = self.folder.clone() {
-                    self.load_folder(f);
-                }
+                self.refresh();
             }
             ui.add_space(6.0);
             let slider_w = 380.0;
@@ -378,8 +507,9 @@ impl CyclopsApp {
                 .margin(vec2(8.0, 5.0));
             let resp = ui.add(edit);
             if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                let p = PathBuf::from(self.path_edit.trim());
-                if p.is_dir() {
+                let typed = self.path_edit.trim();
+                let p = if typed.eq_ignore_ascii_case("network") { PathBuf::from(shell::NETWORK) } else { PathBuf::from(typed) };
+                if p.is_dir() || fs::is_virtual(&p) {
                     self.navigate(p);
                 } else if p.is_file() {
                     if let Some(parent) = p.parent() {
@@ -434,6 +564,7 @@ impl CyclopsApp {
         let indent = 4.0 + depth as f32 * 14.0;
         let chevron = Rect::from_min_size(pos2(rect.min.x + indent, rect.min.y + 4.0), vec2(16.0, 16.0));
         let on_chevron = resp.interact_pointer_pos().is_some_and(|p| chevron.expand(3.0).contains(p));
+        let shell_tex = self.shell_icon(path, (16.0 * ui.ctx().pixels_per_point()).ceil() as u32);
 
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
@@ -445,8 +576,12 @@ impl CyclopsApp {
             let chevron_icon = if expanded { Icon::ChevronDown } else { Icon::ChevronRight };
             icons::paint(painter, chevron.shrink(2.0), chevron_icon, theme::TEXT_DIM);
             let icon_rect = Rect::from_min_size(pos2(chevron.max.x + 4.0, rect.min.y + 4.0), vec2(16.0, 16.0));
-            let (icon, icon_color) = if depth == 0 { (Icon::Drive, theme::TEXT_DIM) } else { (Icon::Folder, theme::ACCENT) };
-            icons::paint(painter, icon_rect, icon, icon_color);
+            if let Some(tex) = shell_tex {
+                painter.image(tex, icon_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            } else {
+                let (icon, icon_color) = if depth == 0 { (Icon::Drive, theme::TEXT_DIM) } else { (Icon::Folder, theme::ACCENT) };
+                icons::paint(painter, icon_rect, icon, icon_color);
+            }
             let color = if is_current { Color32::WHITE } else { theme::TEXT };
             let galley = painter.layout_no_wrap(label.to_owned(), FontId::proportional(13.5), color);
             let text_pos = pos2(icon_rect.max.x + 7.0, rect.center().y - galley.size().y / 2.0);
@@ -466,9 +601,19 @@ impl CyclopsApp {
             resp.scroll_to_me(Some(egui::Align::Center));
         }
         if self.expanded.contains(path) {
-            let children = self.tree_children.entry(path.to_path_buf()).or_insert_with(|| fs::subdirs(path)).clone();
-            for child in &children {
-                self.tree_node(ui, child, &fs::file_name(child), depth + 1);
+            match self.children(path) {
+                Some(children) => {
+                    for child in &children {
+                        self.tree_node(ui, child, &fs::display_name(child), depth + 1);
+                    }
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0 + (depth + 1) as f32 * 14.0 + 20.0);
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::TEXT_DIM));
+                        ui.label(egui::RichText::new("Searching…").color(theme::TEXT_DIM).small());
+                    });
+                }
             }
         }
     }
@@ -531,9 +676,7 @@ impl CyclopsApp {
         } else if back {
             self.go_up();
         } else if refresh {
-            if let Some(f) = self.folder.clone() {
-                self.load_folder(f);
-            }
+            self.refresh();
         }
     }
 
@@ -547,7 +690,9 @@ impl CyclopsApp {
             return;
         }
         if self.entries.is_empty() {
-            ui.centered_and_justified(|ui| ui.label(egui::RichText::new("No images here").color(theme::TEXT_DIM)));
+            let searching = self.folder.as_ref().is_some_and(|f| self.children_loading.contains(f));
+            let text = if searching { "Searching the network…" } else { "No images here" };
+            ui.centered_and_justified(|ui| ui.label(egui::RichText::new(text).color(theme::TEXT_DIM)));
             return;
         }
 
@@ -618,6 +763,12 @@ impl CyclopsApp {
     }
 
     fn paint_tile(&mut self, ui: &egui::Ui, idx: usize, rect: Rect, hovered: bool) {
+        let dir_icon = if self.entries[idx].is_dir {
+            let path = self.entries[idx].path.clone();
+            self.shell_icon(&path, 128)
+        } else {
+            None
+        };
         let entry = &self.entries[idx];
         let selected = self.selected == Some(idx);
         let painter = ui.painter();
@@ -635,7 +786,13 @@ impl CyclopsApp {
         let img_area = Rect::from_min_size(rect.min + vec2(6.0, 6.0), vec2(rect.width() - 12.0, self.thumb_size - 0.0));
         if entry.is_dir {
             let side = self.thumb_size * 0.45;
-            icons::paint(painter, Rect::from_center_size(img_area.center(), vec2(side, side)), Icon::Folder, theme::ACCENT);
+            let icon_rect = Rect::from_center_size(img_area.center(), vec2(side, side));
+            match dir_icon {
+                Some(tex) => {
+                    painter.image(tex, icon_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                None => icons::paint(painter, icon_rect, Icon::Folder, theme::ACCENT),
+            }
         } else {
             let state = self.thumbs.entry(entry.path.clone()).or_insert_with(|| {
                 self.loader.request_thumb(entry.path.clone(), THUMB_DECODE_SIDE);
@@ -965,6 +1122,8 @@ impl eframe::App for CyclopsApp {
         storage.set_string("thumb_size", self.thumb_size.to_string());
         storage.set_string("sort_key", self.sort_key.label().to_owned());
         storage.set_string("sort_desc", self.sort_desc.to_string());
+        let places: Vec<String> = self.network_places.iter().map(|p| p.display().to_string()).collect();
+        storage.set_string("network_places", places.join("\n"));
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

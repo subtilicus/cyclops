@@ -52,7 +52,8 @@ multi-threaded decoding (zune-jpeg fast path), neighbour prefetch and a zoom/pan
 | Viewer  | Left-drag · double-click              | Pan · toggle fit / 100%   |
 | Viewer  | 0 · 1 · F / F11 · Esc                 | Fit · 100% · Fullscreen · Back |
 
-Pass a folder or image path on the command line to open it directly.
+Pass a folder or image path on the command line to open it directly. Network: browse via the
+Network node, or type `\\server` or `\\server\share` in the path bar; visited servers are remembered.
 
 ## Building
 

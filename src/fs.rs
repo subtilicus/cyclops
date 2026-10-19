@@ -42,29 +42,114 @@ impl SortKey {
     }
 }
 
-/// Places shown at the top of the folder tree.
+/// Places shown at the top of the folder tree: user folders, home, drives, network.
 pub fn roots() -> Vec<(String, PathBuf)> {
-    let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
-        let home = PathBuf::from(home);
-        for (label, sub) in [("Pictures", "Pictures"), ("Desktop", "Desktop"), ("Downloads", "Downloads")] {
-            let p = home.join(sub);
-            if p.is_dir() {
-                roots.push((label.to_owned(), p));
+    let mut roots = crate::shell::known_folders();
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
+    if roots.is_empty() {
+        if let Some(home) = &home {
+            for sub in ["Desktop", "Downloads", "Documents", "Pictures"] {
+                let p = home.join(sub);
+                if p.is_dir() {
+                    roots.push((sub.to_owned(), p));
+                }
             }
         }
+    }
+    if let Some(home) = home {
         roots.push(("Home".to_owned(), home));
     }
     #[cfg(windows)]
-    for letter in b'A'..=b'Z' {
-        let drive = PathBuf::from(format!("{}:\\", letter as char));
-        if drive.exists() {
-            roots.push((format!("{}:", letter as char), drive));
+    {
+        for letter in b'A'..=b'Z' {
+            let drive = PathBuf::from(format!("{}:\\", letter as char));
+            if drive.exists() {
+                roots.push((format!("{}:", letter as char), drive));
+            }
         }
+        roots.push(("Network".to_owned(), PathBuf::from(crate::shell::NETWORK)));
     }
     #[cfg(not(windows))]
     roots.push(("/".to_owned(), PathBuf::from("/")));
     roots
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Location {
+    /// The virtual "Network" folder.
+    Network,
+    /// `\\server` — lists shares, not a real directory.
+    Server,
+    /// `\\server\share\`
+    ShareRoot,
+    /// Anything inside a share.
+    Remote,
+    Local,
+}
+
+pub fn location(p: &Path) -> Location {
+    let s = p.to_string_lossy();
+    if s == crate::shell::NETWORK {
+        return Location::Network;
+    }
+    match s.strip_prefix(r"\\") {
+        Some(rest) if !rest.starts_with(r"?\") && !rest.starts_with(r".\") => {
+            match rest.split('\\').filter(|x| !x.is_empty()).count() {
+                0 => Location::Local,
+                1 => Location::Server,
+                2 => Location::ShareRoot,
+                _ => Location::Remote,
+            }
+        }
+        _ => Location::Local,
+    }
+}
+
+/// Network and server locations are listed through the shell rather than the file system.
+pub fn is_virtual(p: &Path) -> bool {
+    matches!(location(p), Location::Network | Location::Server)
+}
+
+/// Anything that may be slow to enumerate and must not block the UI thread.
+pub fn is_remote(p: &Path) -> bool {
+    location(p) != Location::Local
+}
+
+pub fn parent(p: &Path) -> Option<PathBuf> {
+    match location(p) {
+        Location::Network => None,
+        Location::Server => Some(PathBuf::from(crate::shell::NETWORK)),
+        Location::ShareRoot => {
+            let s = p.to_string_lossy();
+            let server = s.trim_start_matches('\\').split('\\').next().unwrap_or_default();
+            Some(PathBuf::from(format!(r"\\{server}")))
+        }
+        Location::Remote | Location::Local => p.parent().map(Path::to_path_buf),
+    }
+}
+
+pub fn display_name(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    match location(p) {
+        Location::Network => "Network".to_owned(),
+        Location::Server | Location::ShareRoot => {
+            s.trim_end_matches('\\').rsplit('\\').next().unwrap_or_default().to_owned()
+        }
+        _ => file_name(p),
+    }
+}
+
+/// Subfolders of any location, including network ones. May block on the network.
+pub fn subdirs_any(p: &Path) -> Vec<PathBuf> {
+    if is_virtual(p) {
+        crate::shell::network_children(&p.to_string_lossy()).into_iter().map(|(_, p)| p).collect()
+    } else {
+        subdirs(p)
+    }
+}
+
+pub fn dir_entry(path: PathBuf) -> Entry {
+    Entry { name: display_name(&path), path, is_dir: true, size: 0, modified: None, modified_label: String::new() }
 }
 
 fn is_hidden(path: &Path, name: &str) -> bool {
