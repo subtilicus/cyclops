@@ -1159,9 +1159,14 @@ impl CyclopsApp {
                 let new_center = v.focus - (v.focus - center) * (new_scale / scale);
                 v.pan = new_center - rect.center();
                 v.zoom = Some(new_scale);
-                if v.target.is_none() && v.fit_when_done {
-                    v.zoom = None;
-                    v.fit_when_done = false;
+                if v.fit_when_done {
+                    // Returning to fit also glides the image back to the centre.
+                    v.pan *= 1.0 - t;
+                    if v.target.is_none() {
+                        v.zoom = None;
+                        v.pan = Vec2::ZERO;
+                        v.fit_when_done = false;
+                    }
                 }
             }
 
@@ -1172,11 +1177,12 @@ impl CyclopsApp {
 
             let scale = v.zoom.unwrap_or(fit);
             let size = natural * scale;
-            // Keep the image from drifting off-screen.
-            let max_pan = ((size - rect.size()) / 2.0).max(Vec2::ZERO);
+            // Allow panning until an image edge reaches the view centre, so any part of the
+            // image (corners included) can be centred, but it can never be lost entirely.
+            let max_pan = size / 2.0;
             v.pan = v.pan.clamp(-max_pan, max_pan);
             let draw = Rect::from_center_size(rect.center() + v.pan, size);
-            if max_pan != Vec2::ZERO && resp.hovered() {
+            if resp.hovered() {
                 ctx.set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
             }
             zoom_pct = Some(scale * ppp * 100.0);
