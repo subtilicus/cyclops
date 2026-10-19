@@ -510,6 +510,7 @@ dependencies = [
  "egui",
  "image",
  "psd",
+ "rayon",
  "resvg",
  "windows",
  "windows-core",

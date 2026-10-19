@@ -44,6 +44,8 @@ pub struct Images {
     pub source_size: [usize; 2],
     /// Animation frames and their durations in seconds (empty for stills).
     pub frames: Vec<(ColorImage, f32)>,
+    /// Linear-light data of HDR/EXR images (full-size requests only).
+    pub hdr: Option<decode::Hdr>,
     pub decode_ms: f32,
 }
 
@@ -126,6 +128,7 @@ fn worker(
                     main,
                     screen: None,
                     frames: Vec::new(),
+                    hdr: None,
                     decode_ms: start.elapsed().as_secs_f32() * 1000.0,
                 })
                 .ok_or_else(|| "no thumbnail".to_owned());
@@ -138,7 +141,7 @@ fn worker(
         // RAW/HEIC thumbnails: Explorer's cached thumbnail is far faster than a full decode.
         if job.kind == Kind::Thumb && crate::wic::handles(&job.path) {
             if let Some(main) = crate::shell::thumbnail_only(&job.path, job.max_side) {
-                let images = Images { source_size: main.size, main, screen: None, frames: Vec::new(), decode_ms: 0.0 };
+                let images = Images { source_size: main.size, main, screen: None, frames: Vec::new(), hdr: None, decode_ms: 0.0 };
                 if done_tx.send(Loaded { path: job.path, kind: job.kind, result: Ok(images) }).is_err() {
                     return;
                 }
@@ -165,7 +168,8 @@ fn worker(
                 })
                 .flatten();
             let main = to_color_image(main_img, d.opaque);
-            Images { main, screen, source_size, frames, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
+            let hdr = if full { d.hdr } else { None };
+            Images { main, screen, source_size, frames, hdr, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
         });
         if done_tx.send(Loaded { path: job.path, kind: job.kind, result }).is_err() {
             return;

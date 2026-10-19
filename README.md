@@ -47,6 +47,7 @@ multi-threaded decoding (zune-jpeg fast path), neighbour prefetch and a zoom/pan
 | Browser | Arrows / PgUp / PgDn / Home / End     | Move selection            |
 | Browser | Enter / double-click                  | Open image or folder      |
 | Browser | Backspace · Alt+← · F5                | Up · Back · Refresh       |
+| Both    | F2 · Del · right-click                | Rename · Delete (Recycle Bin) · menu with Show in Explorer |
 | Viewer  | → ↓ Space PgDn / ← ↑ Backspace PgUp   | Next / previous image     |
 | Viewer  | Mouse wheel · pinch · + / -           | Smooth zoom around cursor |
 | Viewer  | Left-drag · double-click              | Pan · toggle fit / 100%   |
@@ -60,7 +61,8 @@ Network node, or type `\\server` or `\\server\share` in the path bar; visited se
 **Images:** JPEG, PNG/APNG, GIF, WebP, BMP, TIFF, ICO, TGA, DDS, HDR, EXR, QOI, PNM, SVG and PSD (composite)
 are decoded in-process; HEIC/HEIF, AVIF, JPEG XL, JPEG XR and camera RAW (DNG, CR2/CR3, NEF, ARW, RAF,
 ORF, RW2, …) go through the Windows Imaging Component, using the OS's (free) codec extensions.
-Animated GIF, WebP and APNG play in the viewer and preview.
+Animated GIF, WebP and APNG play in the viewer and preview. HDR/EXR are tone-mapped (auto exposure +
+ACES) with a live exposure slider.
 
 **Video** (mp4, mov, mkv, wmv, avi, webm, …) plays through Windows Media Foundation: the OS codecs
 decode on the GPU, so Cyclops bundles no codecs and carries no codec licensing obligations.

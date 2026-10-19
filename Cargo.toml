@@ -16,6 +16,7 @@ eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "de
 egui = "0.37"
 image = { version = "0.25.10", default-features = false, features = ["png", "gif", "bmp", "webp", "tiff", "rayon", "ico", "tga", "dds", "hdr", "exr", "qoi", "pnm"] }
 psd = "0.3.5"
+rayon = "1.12.0"
 resvg = "0.48.1"
 zune-core = "0.5.3"
 zune-jpeg = "0.5.15"

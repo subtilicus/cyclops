@@ -59,17 +59,20 @@ pub struct Decoded {
     pub source_size: [u32; 2],
     /// Animation frames with their display time in seconds (empty for stills).
     pub frames: Vec<(RgbaImage, f32)>,
+    /// Linear-light data for HDR/EXR, for exposure changes.
+    pub hdr: Option<Hdr>,
 }
 
 impl Decoded {
     fn still(image: RgbaImage, opaque: bool) -> Self {
         let source_size = [image.width(), image.height()];
-        Self { image, opaque, source_size, frames: Vec::new() }
+        Self { image, opaque, source_size, frames: Vec::new(), hdr: None }
     }
 }
 
 /// Decode `path`. Raster formats that can scale while decoding (WIC) stop at `max_side`;
-/// vector formats render with their longest side at `vector_side`. With `animate`, animated
+/// vector formats render with their longest side at `vector_side` (also the size HDR data is
+/// kept at for exposure edits). With `animate`, animated
 /// GIF/WebP/APNG return all frames.
 pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Result<Decoded, String> {
     let ext = extension(path);
@@ -77,13 +80,13 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
         let wic = crate::wic::decode(path, max_side).map_err(|e| codec_hint(&ext, e))?;
         let image = apply_orientation(wic.image, wic.orientation);
         let opaque = is_opaque(&image);
-        return Ok(Decoded { image, opaque, source_size: wic.source_size, frames: Vec::new() });
+        return Ok(Decoded { image, opaque, source_size: wic.source_size, frames: Vec::new(), hdr: None });
     }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     match ext.as_str() {
         "svg" | "svgz" => return decode_svg(&bytes, vector_side),
         "psd" => return decode_psd(&bytes),
-        "hdr" | "exr" => return decode_hdr(&bytes),
+        "hdr" | "exr" => return decode_hdr(&bytes, vector_side),
         _ => {}
     }
     if is_jpeg(path) {
@@ -96,7 +99,7 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
         if let Some(frames) = decode_animation(&bytes, &ext) {
             let image = frames[0].0.clone();
             let source_size = [image.width(), image.height()];
-            return Ok(Decoded { image, opaque: false, source_size, frames });
+            return Ok(Decoded { image, opaque: false, source_size, frames, hdr: None });
         }
     }
     let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
@@ -192,42 +195,70 @@ fn decode_svg(bytes: &[u8], side: u32) -> Result<Decoded, String> {
     Ok(Decoded::still(image, opaque))
 }
 
-/// Radiance HDR and OpenEXR hold linear scene light. Map it to display: auto-exposure from the
-/// log-average luminance, the ACES filmic curve (Narkowicz fit) for highlights, then sRGB encoding.
-fn decode_hdr(bytes: &[u8]) -> Result<Decoded, String> {
-    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?.into_rgba32f();
-    let (w, h) = img.dimensions();
-    let px = img.as_raw();
+/// Linear-light pixels of an HDR/EXR image, kept so exposure can be changed after decoding.
+pub struct Hdr {
+    pub size: [u32; 2],
+    pixels: Vec<[f32; 4]>,
+    /// Exposure multiplier that maps the scene's log-average luminance to middle grey.
+    auto_exposure: f32,
+}
 
-    let luminance = |p: &[f32]| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
-    let (mut log_sum, mut count) = (0.0f64, 0usize);
-    for p in px.chunks_exact(4).step_by(7) {
-        let l = luminance(p);
-        if l.is_finite() && l > 0.0 {
-            log_sum += (l as f64 + 1e-4).ln();
-            count += 1;
+impl Hdr {
+    fn new(image: &image::Rgba32FImage) -> Self {
+        let pixels: Vec<[f32; 4]> = image.pixels().map(|p| p.0).collect();
+        let luminance = |p: &[f32; 4]| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+        let (mut log_sum, mut count) = (0.0f64, 0usize);
+        for p in pixels.iter().step_by(7) {
+            let l = luminance(p);
+            if l.is_finite() && l > 0.0 {
+                log_sum += (l as f64 + 1e-4).ln();
+                count += 1;
+            }
         }
+        let average = if count > 0 { (log_sum / count as f64).exp() as f32 } else { 0.18 };
+        let auto_exposure = (0.18 / average.max(1e-6)).clamp(1.0 / 64.0, 64.0);
+        Self { size: [image.width(), image.height()], pixels, auto_exposure }
     }
-    let average = if count > 0 { (log_sum / count as f64).exp() as f32 } else { 0.18 };
-    // Map the scene's average to middle grey, within sane limits.
-    let exposure = (0.18 / average.max(1e-6)).clamp(1.0 / 64.0, 64.0);
 
-    let aces = |x: f32| {
-        let x = (x * exposure).max(0.0);
-        ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
-    };
-    let to_srgb = |c: f32| {
-        let v = if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
-        (v * 255.0 + 0.5) as u8
-    };
-    let mut out = Vec::with_capacity(px.len());
-    for p in px.chunks_exact(4) {
-        let a = if p[3].is_finite() { p[3].clamp(0.0, 1.0) } else { 1.0 };
-        out.extend([to_srgb(aces(p[0])), to_srgb(aces(p[1])), to_srgb(aces(p[2])), (a * 255.0 + 0.5) as u8]);
+    /// Display-ready pixels at `ev` stops relative to auto exposure: ACES filmic curve
+    /// (Narkowicz fit) for highlights, then sRGB encoding.
+    pub fn tonemap(&self, ev: f32) -> RgbaImage {
+        use rayon::prelude::*;
+        let exposure = self.auto_exposure * 2f32.powf(ev);
+        let aces = |x: f32| {
+            let x = if x.is_finite() { (x * exposure).max(0.0) } else { 0.0 };
+            ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
+        };
+        let to_srgb = |c: f32| {
+            let v = if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+            (v * 255.0 + 0.5) as u8
+        };
+        let mut out = vec![0u8; self.pixels.len() * 4];
+        out.par_chunks_mut(4).zip(self.pixels.par_iter()).for_each(|(o, p)| {
+            let a = if p[3].is_finite() { p[3].clamp(0.0, 1.0) } else { 1.0 };
+            o.copy_from_slice(&[to_srgb(aces(p[0])), to_srgb(aces(p[1])), to_srgb(aces(p[2])), (a * 255.0 + 0.5) as u8]);
+        });
+        RgbaImage::from_raw(self.size[0], self.size[1], out).expect("tonemap buffer size")
     }
-    let image = RgbaImage::from_raw(w, h, out).ok_or("HDR buffer size mismatch")?;
+}
+
+/// Radiance HDR and OpenEXR hold linear scene light: tone-map for display and keep the linear
+/// data (scaled to at most `edit_side`) for live exposure changes.
+fn decode_hdr(bytes: &[u8], edit_side: u32) -> Result<Decoded, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?.into_rgba32f();
+    let full = Hdr::new(&img);
+    let image = full.tonemap(0.0);
+    let (w, h) = img.dimensions();
+    let edit = if w.max(h) > edit_side {
+        let scale = edit_side as f32 / w.max(h) as f32;
+        let (ew, eh) = (((w as f32 * scale) as u32).max(1), ((h as f32 * scale) as u32).max(1));
+        let small = image::imageops::resize(&img, ew, eh, image::imageops::FilterType::Triangle);
+        Hdr { auto_exposure: full.auto_exposure, ..Hdr::new(&small) }
+    } else {
+        full
+    };
     let opaque = is_opaque(&image);
-    Ok(Decoded::still(image, opaque))
+    Ok(Decoded { hdr: Some(edit), ..Decoded::still(image, opaque) })
 }
 
 /// Photoshop files carry a flattened composite of all layers; show that.

@@ -5,6 +5,7 @@ mod decode;
 mod fs;
 mod icons;
 mod loader;
+mod ops;
 mod shell;
 mod theme;
 mod video;

@@ -11,6 +11,7 @@ use egui::{
 use crate::fs::{self, Entry, SortKey};
 use crate::icons::{self, Icon};
 use crate::loader::{Kind, Loader};
+use crate::ops;
 use crate::shell::{self, IconLoader};
 use crate::theme;
 use crate::video::{self, VideoPlayer};
@@ -83,6 +84,27 @@ struct FullImage {
     frames: Vec<(TextureHandle, f32)>,
     /// When the image became ready; animations play from here.
     ready_at: f64,
+    /// HDR/EXR linear data and the exposure (EV) being shown.
+    hdr: Option<HdrEdit>,
+}
+
+struct HdrEdit {
+    data: crate::decode::Hdr,
+    ev: f32,
+    shown_ev: f32,
+}
+
+/// A file command picked from a menu or shortcut; applied after the frame's UI is drawn.
+enum FileAction {
+    Open(usize),
+    Reveal(PathBuf),
+    Rename(usize),
+    Delete(usize),
+}
+
+enum Dialog {
+    Delete { path: PathBuf, name: String, is_dir: bool },
+    Rename { path: PathBuf, text: String, error: Option<String>, fresh: bool },
 }
 
 impl FullImage {
@@ -308,6 +330,10 @@ pub struct CyclopsApp {
     full_lru: VecDeque<PathBuf>,
     fullscreen: bool,
     pending_key_zoom: f32,
+    pending_action: Option<FileAction>,
+    dialog: Option<Dialog>,
+    /// A short message (e.g. a failed delete) and when it was posted.
+    toast: Option<(String, f64)>,
     /// Zoom/pan of the preview pane, and the file it applies to (reset on selection change).
     preview_view: ZoomPan,
     preview_for: Option<PathBuf>,
@@ -384,6 +410,9 @@ impl CyclopsApp {
             fullscreen: false,
             pending_key_zoom: 1.0,
             video: None,
+            pending_action: None,
+            dialog: None,
+            toast: None,
             preview_view: ZoomPan::default(),
             preview_for: None,
             last_pointer_activity: 0.0,
@@ -665,6 +694,7 @@ impl CyclopsApp {
                                     })
                                     .collect(),
                                 ready_at: ctx.input(|i| i.time),
+                                hdr: images.hdr.map(|data| HdrEdit { data, ev: 0.0, shown_ev: 0.0 }),
                                 main: ctx.load_texture(name.clone(), images.main, TextureOptions::LINEAR),
                                 screen: images
                                     .screen
@@ -935,6 +965,14 @@ impl CyclopsApp {
             self.tree_root = Some(root.to_path_buf());
             self.navigate(path.to_path_buf());
         }
+        if !fs::is_virtual(path) {
+            resp.context_menu(|ui| {
+                if ui.button("Show in Explorer").clicked() {
+                    ops::reveal(path);
+                    ui.close();
+                }
+            });
+        }
         if is_current && self.scroll_tree_to_folder {
             resp.scroll_to_me(Some(egui::Align::Center));
         }
@@ -996,6 +1034,14 @@ impl CyclopsApp {
         if let Some(m) = moved {
             self.selected = Some(m);
             self.scroll_to_selected = true;
+        }
+        if let Some(sel) = self.selected {
+            let (delete, rename) = ctx.input(|i| (i.key_pressed(Key::Delete), i.key_pressed(Key::F2)));
+            if delete {
+                self.pending_action = Some(FileAction::Delete(sel));
+            } else if rename {
+                self.pending_action = Some(FileAction::Rename(sel));
+            }
         }
         let (enter, back, alt_left, refresh) = ctx.input(|i| {
             (
@@ -1068,6 +1114,7 @@ impl CyclopsApp {
 
         let mut clicked = None;
         let mut activated = None;
+        let mut menu_action = None;
         area.show_viewport(ui, |ui, viewport| {
             self.grid_viewport = viewport;
             ui.set_min_size(vec2(avail_w, total_h));
@@ -1082,9 +1129,10 @@ impl CyclopsApp {
                 let min = origin + vec2(gap_x + col as f32 * (cell.x + gap_x), gap + row as f32 * row_h);
                 let rect = Rect::from_min_size(min, cell);
                 let resp = ui.interact(rect, ui.scope_id().with(("tile", idx)), Sense::click());
-                if resp.clicked() {
+                if resp.clicked() || resp.secondary_clicked() {
                     clicked = Some(idx);
                 }
+                resp.context_menu(|ui| file_menu(ui, idx, &self.entries[idx], true, &mut menu_action));
                 if resp.double_clicked() {
                     activated = Some(idx);
                 }
@@ -1098,6 +1146,9 @@ impl CyclopsApp {
         }
         if let Some(i) = activated {
             self.activate(i);
+        }
+        if menu_action.is_some() {
+            self.pending_action = menu_action;
         }
     }
 
@@ -1212,6 +1263,12 @@ impl CyclopsApp {
     fn viewer_input(&mut self, ctx: &egui::Context) {
         let Some(v) = &self.viewer else { return };
         let index = v.index;
+        let (delete, rename) = ctx.input(|i| (i.key_pressed(Key::Delete), i.key_pressed(Key::F2)));
+        if delete {
+            self.pending_action = Some(FileAction::Delete(index));
+        } else if rename {
+            self.pending_action = Some(FileAction::Rename(index));
+        }
         let is_video = self.entries.get(index).is_some_and(|e| e.is_video);
         let (play_pause, mute) = ctx.input(|i| (is_video && i.key_pressed(Key::Space), is_video && i.key_pressed(Key::M)));
         if let Some((_, Ok(player))) = &mut self.video {
@@ -1388,6 +1445,14 @@ impl CyclopsApp {
         if let (false, Some(Full::Failed(e))) = (entry.is_video, self.full.get(&entry.path)) {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, format!("Could not open image\n{e}"), FontId::proportional(16.0), theme::p().text_dim);
         }
+        let mut menu_action = None;
+        resp.context_menu(|ui| file_menu(ui, index, &entry, false, &mut menu_action));
+        if menu_action.is_some() {
+            self.pending_action = menu_action;
+        }
+        if !entry.is_video {
+            self.exposure_control(ui, rect, &entry.path);
+        }
         // Overlay opacity: videos fade their controls (and the info pill) out when the mouse rests.
         let overlay_alpha = if entry.is_video { self.video_controls(ui, rect) } else { 1.0 };
 
@@ -1449,6 +1514,11 @@ impl CyclopsApp {
         let info_h = 64.0;
         let img_rect = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y - info_h));
         let resp = ui.interact(img_rect, ui.scope_id().with("preview"), Sense::click_and_drag());
+        let mut menu_action = None;
+        resp.context_menu(|ui| file_menu(ui, index, &entry, true, &mut menu_action));
+        if menu_action.is_some() {
+            self.pending_action = menu_action;
+        }
         if self.preview_for.as_ref() != Some(&entry.path) {
             self.preview_for = Some(entry.path.clone());
             self.preview_view = ZoomPan::default();
@@ -1497,6 +1567,7 @@ impl CyclopsApp {
                 };
                 ui.painter().with_clip_rect(img_rect).image(tex, draw, uv, Color32::WHITE);
             }
+            self.exposure_control(ui, img_rect, &entry.path);
             if let Some((size, ..)) = &full {
                 details.push(format!("{}×{}", size.x as u32, size.y as u32));
             } else if let Some(Full::Failed(e)) = self.full.get(&entry.path) {
@@ -1663,6 +1734,279 @@ fn video_badge(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
     icons::paint(painter, Rect::from_center_size(center, Vec2::splat(radius * 1.1)), Icon::Play, Color32::WHITE);
 }
 
+/// The right-click menu for a file or folder.
+fn file_menu(ui: &mut egui::Ui, index: usize, entry: &Entry, include_open: bool, action: &mut Option<FileAction>) {
+    ui.set_min_width(200.0);
+    let mut pick = |a: FileAction, ui: &mut egui::Ui| {
+        *action = Some(a);
+        ui.close();
+    };
+    if include_open && ui.add(egui::Button::new("Open").shortcut_text("Enter")).clicked() {
+        pick(FileAction::Open(index), ui);
+    }
+    if ui.button("Show in Explorer").clicked() {
+        pick(FileAction::Reveal(entry.path.clone()), ui);
+    }
+    if fs::is_virtual(&entry.path) {
+        return;
+    }
+    ui.separator();
+    if ui.add(egui::Button::new("Rename…").shortcut_text("F2")).clicked() {
+        pick(FileAction::Rename(index), ui);
+    }
+    if ui.add(egui::Button::new("Delete…").shortcut_text("Del")).clicked() {
+        pick(FileAction::Delete(index), ui);
+    }
+}
+
+impl CyclopsApp {
+    fn apply_pending_action(&mut self) {
+        let Some(action) = self.pending_action.take() else { return };
+        let entry = |i: usize| self.entries.get(i).filter(|e| !fs::is_virtual(&e.path)).cloned();
+        match action {
+            FileAction::Open(i) => self.activate(i),
+            FileAction::Reveal(path) => ops::reveal(&path),
+            FileAction::Rename(i) => {
+                if let Some(e) = entry(i) {
+                    self.dialog = Some(Dialog::Rename { path: e.path, text: e.name, error: None, fresh: true });
+                }
+            }
+            FileAction::Delete(i) => {
+                if let Some(e) = entry(i) {
+                    self.dialog = Some(Dialog::Delete { path: e.path, name: e.name, is_dir: e.is_dir });
+                }
+            }
+        }
+    }
+
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.dialog else { return };
+        let (mut confirm, mut cancel) = (false, false);
+        let modal = egui::Modal::new(egui::Id::NULL.with("cyclops-file-dialog")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            let danger = Color32::from_rgb(220, 60, 60);
+            match dialog {
+                Dialog::Delete { name, is_dir, .. } => {
+                    ui.heading(format!("Delete \u{201c}{name}\u{201d}?"));
+                    ui.add_space(4.0);
+                    let what = if *is_dir { "This folder and everything in it" } else { "The file" };
+                    ui.label(egui::RichText::new(format!("{what} will be moved to the Recycle Bin.")).color(theme::p().text_dim));
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let delete = egui::Button::new(egui::RichText::new("Delete").color(Color32::WHITE)).fill(danger);
+                        if ui.add(delete).clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+                Dialog::Rename { path, text, error, fresh } => {
+                    ui.heading("Rename");
+                    ui.add_space(6.0);
+                    let output = egui::TextEdit::singleline(text).desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)).show(ui);
+                    if *fresh {
+                        // Focus the field with the name (not the extension) selected, like Explorer.
+                        *fresh = false;
+                        output.response.response.request_focus();
+                        let total = text.chars().count();
+                        let stem = if path.is_dir() {
+                            total
+                        } else {
+                            Path::new(text.as_str()).file_stem().map_or(total, |s| s.to_string_lossy().chars().count())
+                        };
+                        let mut state = output.state;
+                        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(stem),
+                        )));
+                        state.store(ui.ctx(), output.response.response.id);
+                    }
+                    if let Some(e) = error {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(e.as_str()).color(danger));
+                    }
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Rename").clicked() {
+                            confirm = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                }
+            }
+        });
+        if ctx.input(|i| i.key_pressed(Key::Enter)) {
+            confirm = true;
+        }
+        if cancel || (modal.should_close() && !confirm) {
+            self.dialog = None;
+            return;
+        }
+        if !confirm {
+            return;
+        }
+        match self.dialog.take() {
+            Some(Dialog::Delete { path, .. }) => {
+                self.release_file(&path);
+                match ops::recycle(&path) {
+                    Ok(()) => self.remove_entry(&path),
+                    Err(e) => self.show_toast(ctx, e),
+                }
+            }
+            Some(Dialog::Rename { path, text, .. }) => {
+                self.release_file(&path);
+                match ops::rename(&path, &text) {
+                    Ok(new_path) => self.renamed_entry(&path, new_path),
+                    Err(e) => {
+                        self.dialog = Some(Dialog::Rename { path, text, error: Some(e), fresh: false });
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Stop anything holding `path` open (the video player locks its file).
+    fn release_file(&mut self, path: &Path) {
+        if self.video.as_ref().is_some_and(|(p, _)| p == path) {
+            self.video = None;
+        }
+    }
+
+    fn forget_caches(&mut self, path: &Path) {
+        self.thumbs.remove(path);
+        self.full.remove(path);
+        self.full_lru.retain(|p| p != path);
+        if let Some(parent) = path.parent() {
+            self.tree_children.remove(parent);
+        }
+    }
+
+    fn remove_entry(&mut self, path: &Path) {
+        self.forget_caches(path);
+        let Some(idx) = self.entries.iter().position(|e| e.path == path) else { return };
+        self.entries.remove(idx);
+        let n = self.entries.len();
+        self.selected = (n > 0).then(|| idx.min(n - 1));
+        if let Some(v) = &self.viewer {
+            let current = v.index;
+            if current == idx {
+                // Show the next image (or the previous one at the end); leave the viewer if none.
+                let next = (idx..n).find(|&i| !self.entries[i].is_dir).or_else(|| (0..idx).rev().find(|&i| !self.entries[i].is_dir));
+                match next {
+                    Some(i) => self.open_viewer(i),
+                    None => self.close_viewer(&self.ctx.clone()),
+                }
+            } else if current > idx {
+                if let Some(v) = &mut self.viewer {
+                    v.index -= 1;
+                }
+            }
+        }
+        self.scroll_to_selected = true;
+    }
+
+    fn renamed_entry(&mut self, old: &Path, new: PathBuf) {
+        self.forget_caches(old);
+        let Some(entry) = self.entries.iter_mut().find(|e| e.path == old) else { return };
+        entry.name = fs::file_name(&new);
+        entry.path = new.clone();
+        let viewing = self.viewer.as_ref().is_some_and(|v| self.entries.get(v.index).is_some_and(|e| e.path == new));
+        fs::sort(&mut self.entries, self.sort_key, self.sort_desc);
+        let idx = self.entries.iter().position(|e| e.path == new);
+        self.selected = idx;
+        if let (true, Some(i), Some(v)) = (viewing, idx, self.viewer.as_mut()) {
+            v.index = i;
+        }
+        self.scroll_to_selected = true;
+    }
+
+    fn show_toast(&mut self, ctx: &egui::Context, message: String) {
+        self.toast = Some((message, ctx.input(|i| i.time)));
+    }
+
+    fn draw_toast(&mut self, ctx: &egui::Context) {
+        let Some((message, since)) = &self.toast else { return };
+        let age = ctx.input(|i| i.time) - since;
+        if age > 4.0 {
+            self.toast = None;
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        let alpha = ((4.0 - age) / 0.4).clamp(0.0, 1.0) as f32;
+        let mut painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::NULL.with("toast")));
+        painter.multiply_opacity(alpha);
+        let screen = ctx.content_rect();
+        let galley = painter.layout_no_wrap(message.clone(), FontId::proportional(13.0), Color32::WHITE);
+        let pill = Rect::from_center_size(pos2(screen.center().x, screen.max.y - 120.0), galley.size() + vec2(32.0, 16.0));
+        painter.rect(pill, CornerRadius::same(255), Color32::from_rgba_unmultiplied(150, 30, 30, 230), Stroke::NONE, egui::StrokeKind::Inside);
+        painter.galley(pill.min + vec2(16.0, 8.0), galley, Color32::WHITE);
+    }
+
+    /// Glass exposure slider for HDR/EXR images, at the top of `area`.
+    fn exposure_control(&mut self, ui: &mut egui::Ui, area: Rect, path: &Path) {
+        const RANGE: f32 = 4.0;
+        let Some(Full::Ready(img)) = self.full.get_mut(path) else { return };
+        let Some(hdr) = &mut img.hdr else { return };
+        let painter = ui.painter().clone();
+        let fg = theme::DARK.text;
+        let pill = Rect::from_center_size(pos2(area.center().x, area.min.y + 30.0), vec2(360.0, 36.0));
+        painter.rect(pill, CornerRadius::same(12), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
+        let cy = pill.center().y;
+        painter.text(pos2(pill.min.x + 14.0, cy), Align2::LEFT_CENTER, "Exposure", FontId::proportional(12.5), fg);
+
+        let track = Rect::from_min_max(pos2(pill.min.x + 88.0, cy - 2.5), pos2(pill.max.x - 112.0, cy + 2.5));
+        let resp = ui.interact(track.expand2(vec2(8.0, 12.0)), ui.scope_id().with(("exposure", path)), Sense::click_and_drag());
+        if resp.double_clicked() {
+            hdr.ev = 0.0;
+        } else if resp.dragged() || resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let t = ((p.x - track.min.x) / track.width()).clamp(0.0, 1.0);
+                hdr.ev = ((t * 2.0 - 1.0) * RANGE * 10.0).round() / 10.0;
+            }
+        }
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                hdr.ev = (hdr.ev + scroll / 120.0).clamp(-RANGE, RANGE);
+            }
+        }
+        let centre_x = track.center().x;
+        let knob_x = track.min.x + track.width() * (hdr.ev / RANGE + 1.0) / 2.0;
+        painter.rect_filled(track, CornerRadius::same(3), Color32::from_white_alpha(40));
+        painter.rect_filled(
+            Rect::from_x_y_ranges(centre_x.min(knob_x)..=centre_x.max(knob_x), track.y_range()),
+            CornerRadius::same(3),
+            theme::DARK.accent,
+        );
+        painter.vline(centre_x, (cy - 6.0)..=(cy + 6.0), Stroke::new(1.0, Color32::from_white_alpha(90)));
+        painter.circle_filled(pos2(knob_x, cy), if resp.hovered() || resp.dragged() { 7.0 } else { 5.5 }, Color32::WHITE);
+        painter.text(pos2(track.max.x + 12.0, cy), Align2::LEFT_CENTER, format!("{:+.1} EV", hdr.ev), FontId::monospace(12.0), fg);
+
+        let auto = Rect::from_center_size(pos2(pill.max.x - 28.0, cy), vec2(44.0, 24.0));
+        let auto_resp = ui.interact(auto, ui.scope_id().with(("exposure-auto", path)), Sense::click());
+        if auto_resp.hovered() {
+            painter.rect_filled(auto, CornerRadius::same(6), Color32::from_white_alpha(24));
+        }
+        painter.text(auto.center(), Align2::CENTER_CENTER, "Auto", FontId::proportional(12.0), if hdr.ev == 0.0 { theme::DARK.text_dim } else { fg });
+        if auto_resp.clicked() {
+            hdr.ev = 0.0;
+        }
+
+        if (hdr.ev - hdr.shown_ev).abs() > 1e-3 {
+            let rgba = hdr.data.tonemap(hdr.ev);
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            img.main.set(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), TextureOptions::LINEAR);
+            img.screen = None;
+            hdr.shown_ev = hdr.ev;
+        }
+    }
+}
+
 /// Whether `folder` lives in the tree branch below `root`.
 fn under_root(folder: &Path, root: &Path) -> bool {
     if fs::location(root) == fs::Location::Network {
@@ -1684,7 +2028,8 @@ impl eframe::App for CyclopsApp {
         self.receive(&ctx);
 
         // F, F11 and Alt+Enter toggle fullscreen everywhere (unless typing in a text field).
-        let fullscreen_key = !ctx.egui_wants_keyboard_input()
+        let fullscreen_key = self.dialog.is_none()
+            && !ctx.egui_wants_keyboard_input()
             && ctx.input(|i| {
                 i.key_pressed(Key::F11) || (i.key_pressed(Key::F) && i.modifiers.is_none()) || (i.modifiers.alt && i.key_pressed(Key::Enter))
             });
@@ -1693,7 +2038,9 @@ impl eframe::App for CyclopsApp {
         } else if self.fullscreen && self.viewer.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.set_fullscreen(&ctx, false);
         }
-        if self.viewer.is_some() {
+        // While a dialog is open it owns the keyboard (Enter/Esc/Del must not reach the views).
+        if self.dialog.is_some() {
+        } else if self.viewer.is_some() {
             self.viewer_input(&ctx);
         } else {
             self.grid_keyboard(&ctx);
@@ -1740,6 +2087,9 @@ impl eframe::App for CyclopsApp {
                 self.preview_divider(ui, panel);
             }
         }
+        self.apply_pending_action();
+        self.dialogs(&ctx);
+        self.draw_toast(&ctx);
         self.evict_thumbs();
     }
 
