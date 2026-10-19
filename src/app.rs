@@ -1,0 +1,906 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+
+use egui::text::{LayoutJob, TextWrapping};
+use egui::{
+    Align2, Color32, CornerRadius, FontId, Key, Rect, Sense, Stroke, TextFormat, TextureHandle, TextureOptions,
+    Vec2, pos2, vec2,
+};
+
+use crate::fs::{self, Entry};
+use crate::icons::{self, Icon};
+use crate::loader::{Kind, Loader};
+use crate::theme;
+
+/// Thumbnails are decoded at this size and scaled on the GPU for display.
+const THUMB_DECODE_SIDE: u32 = 320;
+const MAX_LIVE_THUMBS: usize = 3000;
+const FULL_CACHE: usize = 8;
+const PREFETCH: usize = 2;
+
+enum Thumb {
+    Pending,
+    Ready { tex: TextureHandle, last_used: u64 },
+    Failed,
+}
+
+enum Full {
+    Pending,
+    Ready(FullImage),
+    Failed(String),
+}
+
+struct FullImage {
+    main: TextureHandle,
+    screen: Option<TextureHandle>,
+    source_size: Vec2,
+    decode_ms: f32,
+}
+
+struct Viewer {
+    /// Index into `entries` (always an image).
+    index: usize,
+    /// Points per source pixel; `None` means fit to window.
+    zoom: Option<f32>,
+    pan: Vec2,
+    wheel_accum: f32,
+}
+
+pub struct CyclopsApp {
+    loader: Loader,
+    roots: Vec<(String, PathBuf)>,
+    tree_children: HashMap<PathBuf, Vec<PathBuf>>,
+    expanded: HashSet<PathBuf>,
+    scroll_tree_to_folder: bool,
+
+    folder: Option<PathBuf>,
+    path_edit: String,
+    entries: Vec<Entry>,
+    list_error: Option<String>,
+    selected: Option<usize>,
+    history: Vec<PathBuf>,
+
+    thumb_size: f32,
+    thumbs: HashMap<PathBuf, Thumb>,
+    grid_cols: usize,
+    grid_viewport: Rect,
+    scroll_to_selected: bool,
+
+    viewer: Option<Viewer>,
+    full: HashMap<PathBuf, Full>,
+    full_lru: VecDeque<PathBuf>,
+    fullscreen: bool,
+    pending_key_zoom: f32,
+
+    frame_no: u64,
+    max_texture_side: u32,
+    screen_side: u32,
+}
+
+impl CyclopsApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, start: Option<PathBuf>) -> Self {
+        theme::apply(&cc.egui_ctx);
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+
+        let stored = |key: &str| cc.storage.and_then(|s| s.get_string(key));
+        let thumb_size = stored("thumb_size").and_then(|s| s.parse().ok()).unwrap_or(160.0);
+        let last_folder = stored("last_folder").map(PathBuf::from).filter(|p| p.is_dir());
+
+        let roots = fs::roots();
+        let mut app = Self {
+            loader: Loader::new(cc.egui_ctx.clone()),
+            roots,
+            tree_children: HashMap::new(),
+            expanded: HashSet::new(),
+            scroll_tree_to_folder: true,
+            folder: None,
+            path_edit: String::new(),
+            entries: Vec::new(),
+            list_error: None,
+            selected: None,
+            history: Vec::new(),
+            thumb_size,
+            thumbs: HashMap::new(),
+            grid_cols: 1,
+            grid_viewport: Rect::NOTHING,
+            scroll_to_selected: false,
+            viewer: None,
+            full: HashMap::new(),
+            full_lru: VecDeque::new(),
+            fullscreen: false,
+            pending_key_zoom: 1.0,
+            frame_no: 0,
+            max_texture_side: 8192,
+            screen_side: 2560,
+        };
+
+        match start {
+            Some(p) if p.is_file() => {
+                if let Some(parent) = p.parent() {
+                    app.navigate(parent.to_path_buf());
+                    if let Some(i) = app.entries.iter().position(|e| e.path == p) {
+                        app.selected = Some(i);
+                        app.open_viewer(i);
+                    }
+                }
+            }
+            Some(p) if p.is_dir() => app.navigate(p),
+            _ => {
+                let fallback = app.roots.first().map(|(_, p)| p.clone());
+                if let Some(p) = last_folder.or(fallback) {
+                    app.navigate(p);
+                }
+            }
+        }
+        app
+    }
+
+    // ------------------------------------------------------------------ navigation
+
+    fn navigate(&mut self, folder: PathBuf) {
+        if self.folder.as_ref() == Some(&folder) {
+            return;
+        }
+        if let Some(prev) = self.folder.take() {
+            self.history.push(prev);
+        }
+        self.load_folder(folder);
+    }
+
+    fn load_folder(&mut self, folder: PathBuf) {
+        self.loader.new_generation();
+        self.thumbs.clear();
+        self.viewer = None;
+        self.selected = None;
+        match fs::list(&folder) {
+            Ok(entries) => {
+                self.entries = entries;
+                self.list_error = None;
+            }
+            Err(e) => {
+                self.entries.clear();
+                self.list_error = Some(e.to_string());
+            }
+        }
+        if !self.entries.is_empty() {
+            self.selected = Some(0);
+        }
+        for ancestor in folder.ancestors().skip(1) {
+            self.expanded.insert(ancestor.to_path_buf());
+        }
+        self.path_edit = folder.display().to_string();
+        self.folder = Some(folder);
+        self.scroll_tree_to_folder = true;
+        self.scroll_to_selected = true;
+    }
+
+    fn go_up(&mut self) {
+        let Some(folder) = self.folder.clone() else { return };
+        if let Some(parent) = folder.parent() {
+            self.navigate(parent.to_path_buf());
+            if let Some(i) = self.entries.iter().position(|e| e.path == folder) {
+                self.selected = Some(i);
+            }
+        }
+    }
+
+    fn go_back(&mut self) {
+        if let Some(prev) = self.history.pop() {
+            self.load_folder(prev);
+        }
+    }
+
+    fn activate(&mut self, index: usize) {
+        let Some(entry) = self.entries.get(index) else { return };
+        if entry.is_dir {
+            self.navigate(entry.path.clone());
+        } else {
+            self.open_viewer(index);
+        }
+    }
+
+    fn open_viewer(&mut self, index: usize) {
+        self.viewer = Some(Viewer { index, zoom: None, pan: Vec2::ZERO, wheel_accum: 0.0 });
+        self.selected = Some(index);
+    }
+
+    fn close_viewer(&mut self, ctx: &egui::Context) {
+        if let Some(v) = self.viewer.take() {
+            self.selected = Some(v.index);
+            self.scroll_to_selected = true;
+        }
+        if self.fullscreen {
+            self.set_fullscreen(ctx, false);
+        }
+    }
+
+    fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
+        self.fullscreen = on;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+    }
+
+    /// Next/previous image (skipping folders) relative to `from`.
+    fn step_image(&self, from: usize, forward: bool) -> Option<usize> {
+        let is_img = |i: &usize| !self.entries[*i].is_dir;
+        if forward {
+            (from + 1..self.entries.len()).find(is_img)
+        } else {
+            (0..from).rev().find(is_img)
+        }
+    }
+
+    // ------------------------------------------------------------------ loading
+
+    fn receive(&mut self, ctx: &egui::Context) {
+        for loaded in self.loader.poll() {
+            let name = loaded.path.display().to_string();
+            match loaded.kind {
+                Kind::Thumb => {
+                    // Ignore results for thumbnails we no longer care about (folder changed).
+                    if let Some(slot) = self.thumbs.get_mut(&loaded.path) {
+                        *slot = match loaded.result {
+                            Ok(images) => Thumb::Ready {
+                                tex: ctx.load_texture(name, images.main, TextureOptions::LINEAR),
+                                last_used: self.frame_no,
+                            },
+                            Err(_) => Thumb::Failed,
+                        };
+                    }
+                }
+                Kind::Full => {
+                    if let Some(slot) = self.full.get_mut(&loaded.path) {
+                        *slot = match loaded.result {
+                            Ok(images) => Full::Ready(FullImage {
+                                main: ctx.load_texture(name.clone(), images.main, TextureOptions::LINEAR),
+                                screen: images
+                                    .screen
+                                    .map(|s| ctx.load_texture(name + "#screen", s, TextureOptions::LINEAR)),
+                                source_size: vec2(images.source_size[0] as f32, images.source_size[1] as f32),
+                                decode_ms: images.decode_ms,
+                            }),
+                            Err(e) => Full::Failed(e),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    fn request_full(&mut self, index: usize) {
+        let path = self.entries[index].path.clone();
+        if let Some(pos) = self.full_lru.iter().position(|p| *p == path) {
+            self.full_lru.remove(pos);
+        }
+        self.full_lru.push_back(path.clone());
+        if !self.full.contains_key(&path) {
+            self.full.insert(path.clone(), Full::Pending);
+            self.loader.request_full(path, self.max_texture_side, self.screen_side);
+        }
+    }
+
+    /// Make sure the current image and its neighbours are loaded or loading; evict old ones.
+    fn update_full_cache(&mut self) {
+        let Some(index) = self.viewer.as_ref().map(|v| v.index) else { return };
+        let mut wanted = vec![index];
+        let (mut fwd, mut back) = (index, index);
+        for _ in 0..PREFETCH {
+            if let Some(n) = self.step_image(fwd, true) {
+                wanted.push(n);
+                fwd = n;
+            }
+            if let Some(p) = self.step_image(back, false) {
+                wanted.push(p);
+                back = p;
+            }
+        }
+        // Request in reverse priority so the current image ends up most-recently-used,
+        // but send the current image first so it is decoded first.
+        for &i in &wanted {
+            self.request_full(i);
+        }
+        self.request_full(index);
+
+        let keep: HashSet<PathBuf> = wanted.iter().map(|&i| self.entries[i].path.clone()).collect();
+        while self.full_lru.len() > FULL_CACHE {
+            let Some(pos) = self.full_lru.iter().position(|p| !keep.contains(p)) else { break };
+            if let Some(p) = self.full_lru.remove(pos) {
+                self.full.remove(&p);
+            }
+        }
+    }
+
+    fn evict_thumbs(&mut self) {
+        let live = self.thumbs.values().filter(|t| matches!(t, Thumb::Ready { .. })).count();
+        if live <= MAX_LIVE_THUMBS {
+            return;
+        }
+        let mut ages: Vec<(u64, PathBuf)> = self
+            .thumbs
+            .iter()
+            .filter_map(|(p, t)| match t {
+                Thumb::Ready { last_used, .. } => Some((*last_used, p.clone())),
+                _ => None,
+            })
+            .collect();
+        ages.sort_unstable_by_key(|(age, _)| *age);
+        for (_, p) in ages.into_iter().take(live - MAX_LIVE_THUMBS * 3 / 4) {
+            self.thumbs.remove(&p);
+        }
+    }
+
+    // ------------------------------------------------------------------ browser UI
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if icons::button(ui, Icon::Back, !self.history.is_empty(), "Back (Alt+←)").clicked() {
+                self.go_back();
+            }
+            let can_go_up = self.folder.as_deref().and_then(Path::parent).is_some();
+            if icons::button(ui, Icon::Up, can_go_up, "Up (Backspace)").clicked() {
+                self.go_up();
+            }
+            if icons::button(ui, Icon::Refresh, true, "Refresh (F5)").clicked() {
+                if let Some(f) = self.folder.clone() {
+                    self.load_folder(f);
+                }
+            }
+            ui.add_space(6.0);
+            let slider_w = 180.0;
+            let edit = egui::TextEdit::singleline(&mut self.path_edit)
+                .desired_width(ui.available_width() - slider_w - 16.0)
+                .margin(vec2(8.0, 5.0));
+            let resp = ui.add(edit);
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                let p = PathBuf::from(self.path_edit.trim());
+                if p.is_dir() {
+                    self.navigate(p);
+                } else if p.is_file() {
+                    if let Some(parent) = p.parent() {
+                        self.navigate(parent.to_path_buf());
+                    }
+                    if let Some(i) = self.entries.iter().position(|e| e.path == p) {
+                        self.open_viewer(i);
+                    }
+                }
+            }
+            ui.add_space(8.0);
+            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+            icons::paint(ui.painter(), r, Icon::Grid, theme::TEXT_DIM);
+            ui.add(egui::Slider::new(&mut self.thumb_size, 80.0..=320.0).show_value(false));
+        });
+    }
+
+    fn folder_tree(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
+            let roots = self.roots.clone();
+            for (label, path) in &roots {
+                self.tree_node(ui, path, label, 0);
+            }
+        });
+        self.scroll_tree_to_folder = false;
+    }
+
+    fn tree_node(&mut self, ui: &mut egui::Ui, path: &Path, label: &str, depth: usize) {
+        let expanded = self.expanded.contains(path);
+        let is_current = self.folder.as_deref() == Some(path);
+
+        let row_h = 24.0;
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(120.0), row_h), Sense::click());
+        let indent = 4.0 + depth as f32 * 14.0;
+        let chevron = Rect::from_min_size(pos2(rect.min.x + indent, rect.min.y + 4.0), vec2(16.0, 16.0));
+        let on_chevron = resp.interact_pointer_pos().is_some_and(|p| chevron.expand(3.0).contains(p));
+
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+            if is_current {
+                painter.rect_filled(rect, CornerRadius::same(6), theme::ACCENT_SOFT);
+            } else if resp.hovered() {
+                painter.rect_filled(rect, CornerRadius::same(6), theme::SURFACE_HOVER);
+            }
+            let chevron_icon = if expanded { Icon::ChevronDown } else { Icon::ChevronRight };
+            icons::paint(painter, chevron.shrink(2.0), chevron_icon, theme::TEXT_DIM);
+            let icon_rect = Rect::from_min_size(pos2(chevron.max.x + 4.0, rect.min.y + 4.0), vec2(16.0, 16.0));
+            let (icon, icon_color) = if depth == 0 { (Icon::Drive, theme::TEXT_DIM) } else { (Icon::Folder, theme::ACCENT) };
+            icons::paint(painter, icon_rect, icon, icon_color);
+            let color = if is_current { Color32::WHITE } else { theme::TEXT };
+            let galley = painter.layout_no_wrap(label.to_owned(), FontId::proportional(13.5), color);
+            let text_pos = pos2(icon_rect.max.x + 7.0, rect.center().y - galley.size().y / 2.0);
+            painter.with_clip_rect(rect).galley(text_pos, galley, color);
+        }
+
+        if resp.clicked() && on_chevron || resp.double_clicked() {
+            if expanded {
+                self.expanded.remove(path);
+            } else {
+                self.expanded.insert(path.to_path_buf());
+            }
+        } else if resp.clicked() {
+            self.navigate(path.to_path_buf());
+        }
+        if is_current && self.scroll_tree_to_folder {
+            resp.scroll_to_me(Some(egui::Align::Center));
+        }
+        if self.expanded.contains(path) {
+            let children = self.tree_children.entry(path.to_path_buf()).or_insert_with(|| fs::subdirs(path)).clone();
+            for child in &children {
+                self.tree_node(ui, child, &fs::file_name(child), depth + 1);
+            }
+        }
+    }
+
+    fn grid_keyboard(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let n = self.entries.len();
+        let cols = self.grid_cols.max(1);
+        let page = cols * ((self.grid_viewport.height() / self.cell_size().y).floor() as usize).max(1);
+        let mut moved = None;
+        let cur = self.selected.unwrap_or(0);
+        ctx.input(|i| {
+            if n > 0 {
+                if i.key_pressed(Key::ArrowRight) {
+                    moved = Some((cur + 1).min(n - 1));
+                }
+                if i.key_pressed(Key::ArrowLeft) {
+                    moved = Some(cur.saturating_sub(1));
+                }
+                if i.key_pressed(Key::ArrowDown) {
+                    moved = Some((cur + cols).min(n - 1));
+                }
+                if i.key_pressed(Key::ArrowUp) {
+                    moved = Some(cur.saturating_sub(cols));
+                }
+                if i.key_pressed(Key::PageDown) {
+                    moved = Some((cur + page).min(n - 1));
+                }
+                if i.key_pressed(Key::PageUp) {
+                    moved = Some(cur.saturating_sub(page));
+                }
+                if i.key_pressed(Key::Home) {
+                    moved = Some(0);
+                }
+                if i.key_pressed(Key::End) {
+                    moved = Some(n - 1);
+                }
+            }
+        });
+        if let Some(m) = moved {
+            self.selected = Some(m);
+            self.scroll_to_selected = true;
+        }
+        let (enter, back, alt_left, refresh) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::Enter),
+                i.key_pressed(Key::Backspace),
+                i.modifiers.alt && i.key_pressed(Key::ArrowLeft),
+                i.key_pressed(Key::F5),
+            )
+        });
+        if enter {
+            if let Some(s) = self.selected {
+                self.activate(s);
+            }
+        } else if alt_left {
+            self.go_back();
+        } else if back {
+            self.go_up();
+        } else if refresh {
+            if let Some(f) = self.folder.clone() {
+                self.load_folder(f);
+            }
+        }
+    }
+
+    fn cell_size(&self) -> Vec2 {
+        vec2(self.thumb_size + 12.0, self.thumb_size + 34.0)
+    }
+
+    fn grid(&mut self, ui: &mut egui::Ui) {
+        if let Some(err) = &self.list_error {
+            ui.centered_and_justified(|ui| ui.label(egui::RichText::new(err.clone()).color(theme::TEXT_DIM)));
+            return;
+        }
+        if self.entries.is_empty() {
+            ui.centered_and_justified(|ui| ui.label(egui::RichText::new("No images here").color(theme::TEXT_DIM)));
+            return;
+        }
+
+        let gap = 10.0;
+        let cell = self.cell_size();
+        let avail_w = ui.available_width();
+        let cols = (((avail_w - gap) / (cell.x + gap)).floor() as usize).max(1);
+        self.grid_cols = cols;
+        // Spread leftover space evenly between columns so the grid is always justified.
+        let gap_x = ((avail_w - cols as f32 * cell.x) / (cols as f32 + 1.0)).max(gap);
+        let row_h = cell.y + gap;
+        let rows = self.entries.len().div_ceil(cols);
+        let total_h = rows as f32 * row_h + gap;
+
+        let mut area = egui::ScrollArea::vertical()
+            .id_salt(("grid", self.folder.clone()))
+            .auto_shrink(false)
+            .wheel_scroll_multiplier(vec2(1.0, 1.6));
+        if self.scroll_to_selected {
+            self.scroll_to_selected = false;
+            if let Some(sel) = self.selected {
+                let top = (sel / cols) as f32 * row_h;
+                let bottom = top + row_h + gap;
+                let vp = self.grid_viewport;
+                if !vp.is_positive() {
+                    area = area.vertical_scroll_offset((top - gap).max(0.0));
+                } else if top < vp.min.y {
+                    area = area.vertical_scroll_offset(top);
+                } else if bottom > vp.max.y {
+                    area = area.vertical_scroll_offset(bottom - vp.height());
+                }
+            }
+        }
+
+        let mut clicked = None;
+        let mut activated = None;
+        area.show_viewport(ui, |ui, viewport| {
+            self.grid_viewport = viewport;
+            ui.set_min_size(vec2(avail_w, total_h));
+            let origin = ui.max_rect().min;
+            // One extra row above/below keeps thumbnails ready just before they scroll into view.
+            let first_row = ((viewport.min.y - gap) / row_h).floor().max(0.0) as usize;
+            let last_row = (((viewport.max.y) / row_h).ceil() as usize + 1).min(rows);
+            let first = (first_row.saturating_sub(1)) * cols;
+            let last = (last_row * cols).min(self.entries.len());
+            for idx in first..last {
+                let (row, col) = (idx / cols, idx % cols);
+                let min = origin + vec2(gap_x + col as f32 * (cell.x + gap_x), gap + row as f32 * row_h);
+                let rect = Rect::from_min_size(min, cell);
+                let resp = ui.interact(rect, ui.scope_id().with(("tile", idx)), Sense::click());
+                if resp.clicked() {
+                    clicked = Some(idx);
+                }
+                if resp.double_clicked() {
+                    activated = Some(idx);
+                }
+                if ui.is_rect_visible(rect) {
+                    self.paint_tile(ui, idx, rect, resp.hovered());
+                }
+            }
+        });
+        if let Some(i) = clicked {
+            self.selected = Some(i);
+        }
+        if let Some(i) = activated {
+            self.activate(i);
+        }
+    }
+
+    fn paint_tile(&mut self, ui: &egui::Ui, idx: usize, rect: Rect, hovered: bool) {
+        let entry = &self.entries[idx];
+        let selected = self.selected == Some(idx);
+        let painter = ui.painter();
+        let radius = CornerRadius::same(8);
+
+        let (fill, stroke) = if selected {
+            (theme::ACCENT_SOFT, Stroke::new(1.5, theme::ACCENT))
+        } else if hovered {
+            (theme::SURFACE_HOVER, Stroke::new(1.0, theme::BORDER))
+        } else {
+            (theme::SURFACE, Stroke::NONE)
+        };
+        painter.rect(rect, radius, fill, stroke, egui::StrokeKind::Inside);
+
+        let img_area = Rect::from_min_size(rect.min + vec2(6.0, 6.0), vec2(rect.width() - 12.0, self.thumb_size - 0.0));
+        if entry.is_dir {
+            let side = self.thumb_size * 0.45;
+            icons::paint(painter, Rect::from_center_size(img_area.center(), vec2(side, side)), Icon::Folder, theme::ACCENT);
+        } else {
+            let state = self.thumbs.entry(entry.path.clone()).or_insert_with(|| {
+                self.loader.request_thumb(entry.path.clone(), THUMB_DECODE_SIDE);
+                Thumb::Pending
+            });
+            match state {
+                Thumb::Ready { tex, last_used } => {
+                    *last_used = self.frame_no;
+                    let size = tex.size_vec2();
+                    let scale = (img_area.width() / size.x).min(img_area.height() / size.y).min(1.0);
+                    let r = Rect::from_center_size(img_area.center(), size * scale);
+                    painter.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                Thumb::Pending => {
+                    painter.rect_filled(img_area.shrink(img_area.width() * 0.12), CornerRadius::same(6), theme::BG.gamma_multiply(0.6));
+                }
+                Thumb::Failed => {
+                    icons::paint(painter, Rect::from_center_size(img_area.center(), vec2(28.0, 28.0)), Icon::Warning, theme::TEXT_DIM);
+                }
+            }
+        }
+
+        let label_w = rect.width() - 14.0;
+        let mut job = LayoutJob::single_section(
+            entry.name.clone(),
+            TextFormat {
+                font_id: FontId::proportional(12.0),
+                color: if selected { Color32::WHITE } else { theme::TEXT_DIM },
+                ..Default::default()
+            },
+        );
+        job.wrap = TextWrapping::truncate_at_width(label_w);
+        let galley = painter.layout_job(job);
+        let pos = pos2(rect.center().x - galley.size().x / 2.0, rect.max.y - 22.0);
+        painter.galley(pos, galley, theme::TEXT_DIM);
+    }
+
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let dirs = self.entries.iter().filter(|e| e.is_dir).count();
+            let images = self.entries.len() - dirs;
+            ui.label(egui::RichText::new(format!("{images} images · {dirs} folders")).color(theme::TEXT_DIM).small());
+            if let Some(e) = self.selected.and_then(|i| self.entries.get(i)) {
+                ui.separator();
+                let mut text = e.name.clone();
+                if !e.is_dir {
+                    text += &format!("  ·  {}", fs::human_size(e.size));
+                }
+                ui.label(egui::RichText::new(text).small());
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------ viewer UI
+
+    fn viewer_input(&mut self, ctx: &egui::Context) {
+        let Some(v) = &self.viewer else { return };
+        let index = v.index;
+        let (next, prev, first, last, esc, fs_toggle, fit, one, zoom_in, zoom_out) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::ArrowDown) || i.key_pressed(Key::Space) || i.key_pressed(Key::PageDown),
+                i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::Backspace) || i.key_pressed(Key::PageUp),
+                i.key_pressed(Key::Home),
+                i.key_pressed(Key::End),
+                i.key_pressed(Key::Escape) || i.key_pressed(Key::Enter),
+                i.key_pressed(Key::F11) || i.key_pressed(Key::F),
+                i.key_pressed(Key::Num0) || i.key_pressed(Key::Slash),
+                i.key_pressed(Key::Num1),
+                i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals),
+                i.key_pressed(Key::Minus),
+            )
+        });
+        let target = if next {
+            self.step_image(index, true)
+        } else if prev {
+            self.step_image(index, false)
+        } else if first {
+            (0..self.entries.len()).find(|&i| !self.entries[i].is_dir)
+        } else if last {
+            (0..self.entries.len()).rev().find(|&i| !self.entries[i].is_dir)
+        } else {
+            None
+        };
+        if let Some(t) = target {
+            self.open_viewer(t);
+        }
+        if esc {
+            if self.fullscreen && ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.set_fullscreen(ctx, false);
+            } else {
+                self.close_viewer(ctx);
+            }
+            return;
+        }
+        if fs_toggle {
+            self.set_fullscreen(ctx, !self.fullscreen);
+        }
+        if let Some(v) = &mut self.viewer {
+            if fit {
+                v.zoom = None;
+                v.pan = Vec2::ZERO;
+            }
+            if one {
+                v.zoom = Some(1.0 / ctx.pixels_per_point());
+            }
+            if zoom_in || zoom_out {
+                // Handled in viewer() where the current scale is known.
+                v.wheel_accum = 0.0;
+            }
+        }
+        self.pending_key_zoom = if zoom_in { 1.25 } else if zoom_out { 0.8 } else { 1.0 };
+    }
+
+    fn viewer(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let rect = ui.max_rect();
+        let resp = ui.allocate_rect(rect, Sense::click_and_drag());
+        let ppp = ctx.pixels_per_point();
+        let Some(index) = self.viewer.as_ref().map(|v| v.index) else { return };
+        let entry = self.entries[index].clone();
+
+        // Pick what to draw: the full image, or the thumbnail as an instant placeholder.
+        let full = self.full.get(&entry.path);
+        let (source_size, status) = match full {
+            Some(Full::Ready(img)) => (Some(img.source_size), format!("{:.0} ms", img.decode_ms)),
+            Some(Full::Failed(e)) => (None, format!("error: {e}")),
+            _ => (None, "loading…".to_owned()),
+        };
+        let thumb = match self.thumbs.get(&entry.path) {
+            Some(Thumb::Ready { tex, .. }) => Some(tex.clone()),
+            _ => None,
+        };
+        let natural = source_size.or_else(|| thumb.as_ref().map(|t| t.size_vec2()));
+
+        let mut zoom_pct = None;
+        if let (Some(natural), Some(v)) = (natural, self.viewer.as_mut()) {
+            // Fit, but never upscale small images beyond 100% (1 source px = 1 screen px).
+            let fit = (rect.width() / natural.x).min(rect.height() / natural.y).min(1.0 / ppp);
+            let fit = if source_size.is_some() { fit } else { (rect.width() / natural.x).min(rect.height() / natural.y) };
+            let scale = v.zoom.unwrap_or(fit);
+
+            // Zoom around a focus point (cursor, or centre for keyboard zoom).
+            let wheel_zoom = if resp.hovered() { ctx.input(|i| i.zoom_delta()) } else { 1.0 };
+            let factor = wheel_zoom * self.pending_key_zoom;
+            if (factor - 1.0).abs() > f32::EPSILON && source_size.is_some() {
+                let new_scale = (scale * factor).clamp(fit.min(0.05), 32.0 / ppp);
+                let focus = if wheel_zoom != 1.0 { resp.hover_pos().unwrap_or(rect.center()) } else { rect.center() };
+                let center = rect.center() + v.pan;
+                let new_center = focus - (focus - center) * (new_scale / scale);
+                v.pan = new_center - rect.center();
+                v.zoom = Some(new_scale);
+            }
+            if resp.dragged() {
+                v.pan += resp.drag_delta();
+            }
+            if resp.double_clicked() {
+                if v.zoom.is_some() {
+                    v.zoom = None;
+                    v.pan = Vec2::ZERO;
+                } else if let Some(p) = resp.interact_pointer_pos() {
+                    let new_scale = 1.0 / ppp;
+                    let center = rect.center();
+                    v.pan = (p - (p - center) * (new_scale / scale)) - center;
+                    v.zoom = Some(new_scale);
+                }
+            }
+
+            let scale = v.zoom.unwrap_or(fit);
+            let size = natural * scale;
+            // Keep the image from drifting off-screen.
+            let max_pan = ((size - rect.size()) / 2.0).max(Vec2::ZERO);
+            v.pan = v.pan.clamp(-max_pan, max_pan);
+            let draw = Rect::from_center_size(rect.center() + v.pan, size);
+            zoom_pct = Some(scale * ppp * 100.0);
+
+            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            let tex_id = match self.full.get(&entry.path) {
+                Some(Full::Ready(img)) => {
+                    let physical = size * ppp;
+                    match &img.screen {
+                        Some(s) if physical.x <= s.size_vec2().x * 1.05 => s.id(),
+                        _ => img.main.id(),
+                    }
+                }
+                _ => match &thumb {
+                    Some(t) => t.id(),
+                    None => egui::TextureId::default(),
+                },
+            };
+            if tex_id != egui::TextureId::default() {
+                ui.painter().with_clip_rect(rect).image(tex_id, draw, uv, Color32::WHITE);
+            }
+        }
+        self.pending_key_zoom = 1.0;
+
+        // Plain mouse wheel flips through images, like FastStone.
+        let scroll = if resp.hovered() {
+            ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::MouseWheel { unit, delta, modifiers, .. } if !modifiers.ctrl => Some(match unit {
+                            egui::MouseWheelUnit::Line => delta.y * 40.0,
+                            egui::MouseWheelUnit::Page => delta.y * 400.0,
+                            egui::MouseWheelUnit::Point => delta.y,
+                        }),
+                        _ => None,
+                    })
+                    .sum::<f32>()
+            })
+        } else {
+            0.0
+        };
+        if scroll != 0.0 {
+            if let Some(v) = self.viewer.as_mut() {
+                v.wheel_accum += scroll;
+                let step = if v.wheel_accum >= 40.0 {
+                    Some(false)
+                } else if v.wheel_accum <= -40.0 {
+                    Some(true)
+                } else {
+                    None
+                };
+                if let Some(forward) = step {
+                    v.wheel_accum = 0.0;
+                    if let Some(t) = self.step_image(index, forward) {
+                        self.open_viewer(t);
+                    }
+                }
+            }
+        }
+
+        if let Some(Full::Failed(e)) = self.full.get(&entry.path) {
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, format!("Could not open image\n{e}"), FontId::proportional(16.0), theme::TEXT_DIM);
+        }
+
+        // Floating glass info pill.
+        let pos_in_folder = self.entries[..=index].iter().filter(|e| !e.is_dir).count();
+        let total = self.entries.iter().filter(|e| !e.is_dir).count();
+        let mut info = format!("{}    {}/{}", entry.name, pos_in_folder, total);
+        if let Some(s) = source_size {
+            info += &format!("    {}×{}", s.x as u32, s.y as u32);
+        }
+        info += &format!("    {}", fs::human_size(entry.size));
+        if let Some(z) = zoom_pct {
+            info += &format!("    {z:.0}%");
+        }
+        info += &format!("    {status}");
+        let painter = ui.painter();
+        let galley = painter.layout_no_wrap(info, FontId::proportional(13.0), theme::TEXT);
+        let pill = Rect::from_center_size(
+            pos2(rect.center().x, rect.max.y - 30.0),
+            galley.size() + vec2(28.0, 14.0),
+        );
+        painter.rect(pill, CornerRadius::same(255), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
+        painter.galley(pill.min + vec2(14.0, 7.0), galley, theme::TEXT);
+    }
+}
+
+impl eframe::App for CyclopsApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.frame_no += 1;
+        self.max_texture_side = ctx.input(|i| i.max_texture_side) as u32;
+        if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
+            self.screen_side = ((m.x.max(m.y)) * ctx.pixels_per_point()).ceil() as u32;
+        }
+        self.receive(&ctx);
+
+        if self.viewer.is_some() {
+            self.viewer_input(&ctx);
+        } else {
+            self.grid_keyboard(&ctx);
+        }
+        self.update_full_cache();
+
+        if self.viewer.is_some() {
+            egui::CentralPanel::no_frame()
+                .frame(egui::Frame::NONE.fill(Color32::from_rgb(8, 8, 10)))
+                .show(ui, |ui| self.viewer(ui));
+        } else {
+            egui::Panel::top("toolbar")
+                .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10, 8)))
+                .show(ui, |ui| self.toolbar(ui));
+            egui::Panel::bottom("status")
+                .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 4)))
+                .show(ui, |ui| self.status_bar(ui));
+            egui::Panel::left("tree")
+                .resizable(true)
+                .default_size(250.0)
+                .size_range(160.0..=500.0)
+                .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(6, 8)))
+                .show(ui, |ui| self.folder_tree(ui));
+            egui::CentralPanel::no_frame()
+                .frame(egui::Frame::NONE.fill(theme::BG))
+                .show(ui, |ui| self.grid(ui));
+        }
+        self.evict_thumbs();
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Some(f) = &self.folder {
+            storage.set_string("last_folder", f.display().to_string());
+        }
+        storage.set_string("thumb_size", self.thumb_size.to_string());
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        theme::BG.to_normalized_gamma_f32()
+    }
+}

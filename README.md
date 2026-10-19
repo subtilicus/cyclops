@@ -35,6 +35,26 @@ navigation, and a modern glass-like interface that stays at your display's full 
 | Caching      | LRU GPU texture cache + RAM decode cache + on-disk thumbnail DB      |
 | I/O          | Memory-mapped files, directory watching, predictive prefetch         |
 
+## Status
+
+Early prototype (egui on wgpu): dark UI, folder tree, virtualized thumbnail grid, background
+multi-threaded decoding (zune-jpeg fast path), neighbour prefetch and a zoom/pan viewer.
+
+### Keys
+
+| Where   | Key                                   | Action                    |
+|---------|---------------------------------------|---------------------------|
+| Browser | Arrows / PgUp / PgDn / Home / End     | Move selection            |
+| Browser | Enter / double-click                  | Open image or folder      |
+| Browser | Backspace · Alt+← · F5                | Up · Back · Refresh       |
+| Viewer  | → ↓ Space PgDn / ← ↑ Backspace PgUp   | Next / previous image     |
+| Viewer  | Mouse wheel                           | Next / previous image     |
+| Viewer  | Ctrl+wheel · + / -                    | Zoom around cursor        |
+| Viewer  | Drag · double-click                   | Pan · toggle fit / 100%   |
+| Viewer  | 0 · 1 · F / F11 · Esc                 | Fit · 100% · Fullscreen · Back |
+
+Pass a folder or image path on the command line to open it directly.
+
 ## Building
 
 ```sh

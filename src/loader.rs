@@ -1,0 +1,144 @@
+//! Background decode workers. Full-size requests always take priority over thumbnails,
+//! and thumbnail jobs from a folder the user has already left are dropped unprocessed.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use crossbeam_channel::{Receiver, Sender, select, unbounded};
+use egui::ColorImage;
+
+use crate::decode;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Thumb,
+    Full,
+}
+
+struct Job {
+    path: PathBuf,
+    kind: Kind,
+    generation: u64,
+    /// Thumb: max side. Full: GPU max texture side.
+    max_side: u32,
+    /// Full only: longest side of a pre-scaled "screen" copy used for smooth downscaled display.
+    screen_side: u32,
+}
+
+pub struct Loaded {
+    pub path: PathBuf,
+    pub kind: Kind,
+    pub result: Result<Images, String>,
+}
+
+pub struct Images {
+    pub main: ColorImage,
+    /// Downscaled copy for when the image is shown much smaller than its native size
+    /// (egui-wgpu has no mipmaps, so this keeps fit-to-window views alias-free).
+    pub screen: Option<ColorImage>,
+    /// Native pixel size of the source image (after EXIF orientation).
+    pub source_size: [usize; 2],
+    pub decode_ms: f32,
+}
+
+pub struct Loader {
+    full_tx: Sender<Job>,
+    thumb_tx: Sender<Job>,
+    done_rx: Receiver<Loaded>,
+    generation: Arc<AtomicU64>,
+}
+
+impl Loader {
+    pub fn new(ctx: egui::Context) -> Self {
+        let (full_tx, full_rx) = unbounded::<Job>();
+        let (thumb_tx, thumb_rx) = unbounded::<Job>();
+        let (done_tx, done_rx) = unbounded();
+        let generation = Arc::new(AtomicU64::new(0));
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(1).max(2);
+        for i in 0..workers {
+            let (full_rx, thumb_rx, done_tx) = (full_rx.clone(), thumb_rx.clone(), done_tx.clone());
+            let generation = generation.clone();
+            let ctx = ctx.clone();
+            std::thread::Builder::new()
+                .name(format!("cyclops-decode-{i}"))
+                .spawn(move || worker(full_rx, thumb_rx, done_tx, generation, ctx))
+                .expect("spawn decode worker");
+        }
+        Self { full_tx, thumb_tx, done_rx, generation }
+    }
+
+    /// Invalidate all queued thumbnail jobs (call when switching folders).
+    pub fn new_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn request_thumb(&self, path: PathBuf, max_side: u32) {
+        let generation = self.generation.load(Ordering::Relaxed);
+        let _ = self.thumb_tx.send(Job { path, kind: Kind::Thumb, generation, max_side, screen_side: 0 });
+    }
+
+    pub fn request_full(&self, path: PathBuf, max_texture_side: u32, screen_side: u32) {
+        let _ = self.full_tx.send(Job {
+            path,
+            kind: Kind::Full,
+            generation: 0,
+            max_side: max_texture_side,
+            screen_side,
+        });
+    }
+
+    pub fn poll(&self) -> impl Iterator<Item = Loaded> + '_ {
+        self.done_rx.try_iter()
+    }
+}
+
+fn worker(
+    full_rx: Receiver<Job>,
+    thumb_rx: Receiver<Job>,
+    done_tx: Sender<Loaded>,
+    generation: Arc<AtomicU64>,
+    ctx: egui::Context,
+) {
+    loop {
+        let job = match full_rx.try_recv() {
+            Ok(job) => job,
+            Err(_) => select! {
+                recv(full_rx) -> job => match job { Ok(j) => j, Err(_) => return },
+                recv(thumb_rx) -> job => match job { Ok(j) => j, Err(_) => return },
+            },
+        };
+        if job.kind == Kind::Thumb && job.generation != generation.load(Ordering::Relaxed) {
+            continue;
+        }
+        let start = Instant::now();
+        let result = decode::decode(&job.path).map(|d| {
+            let source_size = [d.image.width() as usize, d.image.height() as usize];
+            let main_img = decode::fit_within(d.image, job.max_side);
+            let screen = (job.kind == Kind::Full)
+                .then(|| {
+                    let longest = main_img.width().max(main_img.height());
+                    // Only worth it when the image is substantially larger than the screen.
+                    (longest as f32 > job.screen_side as f32 * 1.5)
+                        .then(|| to_color_image(decode::fit_within(main_img.clone(), job.screen_side), d.opaque))
+                })
+                .flatten();
+            let main = to_color_image(main_img, d.opaque);
+            Images { main, screen, source_size, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
+        });
+        if done_tx.send(Loaded { path: job.path, kind: job.kind, result }).is_err() {
+            return;
+        }
+        ctx.request_repaint();
+    }
+}
+
+fn to_color_image(img: image::RgbaImage, opaque: bool) -> ColorImage {
+    let size = [img.width() as usize, img.height() as usize];
+    if opaque {
+        ColorImage::from_rgba_premultiplied(size, img.as_raw())
+    } else {
+        ColorImage::from_rgba_unmultiplied(size, img.as_raw())
+    }
+}
