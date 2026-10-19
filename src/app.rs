@@ -61,6 +61,8 @@ struct Settings {
     three_pane: bool,
     /// Developer: write decode timings to a log file.
     perf_log: bool,
+    /// External photo editor; `None` uses Windows' "Edit" action.
+    editor: Option<PathBuf>,
     /// Width of the preview pane in points.
     preview_width: f32,
 }
@@ -112,6 +114,8 @@ enum FileAction {
     Delete(usize),
     /// Create a folder inside this one and start renaming it.
     NewFolder(PathBuf),
+    /// Open in the external editor.
+    Edit(usize),
 }
 
 enum Dialog {
@@ -378,6 +382,10 @@ pub struct CyclopsApp {
     fullscreen: bool,
     pending_key_zoom: f32,
     pending_action: Option<FileAction>,
+    /// Photo editors found on this PC (for the settings menu).
+    detected_editors: Vec<PathBuf>,
+    /// Window focus last frame; regaining focus re-syncs the folder (e.g. after editing).
+    was_focused: bool,
     dialog: Option<Dialog>,
     /// A short message (e.g. a failed delete) and when it was posted.
     toast: Option<(String, f64)>,
@@ -407,6 +415,7 @@ impl CyclopsApp {
             video_volume: stored("video_volume").and_then(|s| s.parse().ok()).unwrap_or(1.0),
             three_pane: flag("three_pane", false),
             perf_log: flag("perf_log", false),
+            editor: stored("editor").filter(|s| !s.is_empty()).map(PathBuf::from),
             preview_width: stored("preview_width").and_then(|s| s.parse().ok()).unwrap_or(460.0),
         };
         theme::install(&cc.egui_ctx);
@@ -463,6 +472,8 @@ impl CyclopsApp {
             pending_key_zoom: 1.0,
             video: None,
             pending_action: None,
+            detected_editors: crate::editor::detect(),
+            was_focused: true,
             dialog: None,
             toast: None,
             preview_view: ZoomPan::default(),
@@ -948,6 +959,34 @@ impl CyclopsApp {
         ui.checkbox(&mut self.settings.show_info_bar, "Show info bar");
 
         ui.separator();
+        heading(ui, "EDITOR");
+        let current = self.settings.editor.clone();
+        let label = |p: &Option<PathBuf>| p.as_deref().map_or("Windows default".to_owned(), crate::editor::name);
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("editor")
+                .selected_text(label(&current))
+                .width(160.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.settings.editor, None, "Windows default");
+                    for exe in self.detected_editors.clone() {
+                        let name = crate::editor::name(&exe);
+                        ui.selectable_value(&mut self.settings.editor, Some(exe.clone()), name).on_hover_text(exe.display().to_string());
+                    }
+                    if let Some(custom) = current.clone().filter(|c| !self.detected_editors.contains(c)) {
+                        ui.selectable_value(&mut self.settings.editor, Some(custom.clone()), label(&Some(custom)));
+                    }
+                });
+            if ui.button("Browse…").clicked() {
+                if let Some(exe) = crate::editor::pick_program() {
+                    self.settings.editor = Some(exe);
+                }
+            }
+        });
+        if let Some(p) = &self.settings.editor {
+            ui.label(egui::RichText::new(p.display().to_string()).small().color(theme::p().text_dim));
+        }
+
+        ui.separator();
         heading(ui, "DEVELOPER");
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.settings.perf_log, "Write performance log");
@@ -1117,10 +1156,13 @@ impl CyclopsApp {
         }
         if let Some(sel) = self.selected {
             let (delete, rename) = ctx.input(|i| (i.key_pressed(Key::Delete), i.key_pressed(Key::F2)));
+            let edit = ctx.input(|i| i.modifiers.is_none() && i.key_pressed(Key::E));
             if delete {
                 self.pending_action = Some(FileAction::Delete(sel));
             } else if rename {
                 self.pending_action = Some(FileAction::Rename(sel));
+            } else if edit {
+                self.pending_action = Some(FileAction::Edit(sel));
             }
         }
         let (enter, back, alt_left, refresh) = ctx.input(|i| {
@@ -1205,6 +1247,7 @@ impl CyclopsApp {
         let mut clicked = None;
         let mut activated = None;
         let mut menu_action = None;
+        let edit_label = self.edit_label();
         area.show_viewport(ui, |ui, viewport| {
             self.grid_viewport = viewport;
             ui.set_min_size(vec2(avail_w, total_h));
@@ -1222,7 +1265,7 @@ impl CyclopsApp {
                 if resp.clicked() || resp.secondary_clicked() {
                     clicked = Some(idx);
                 }
-                resp.context_menu(|ui| file_menu(ui, idx, &self.entries[idx], true, &mut menu_action));
+                resp.context_menu(|ui| file_menu(ui, &edit_label, idx, &self.entries[idx], true, &mut menu_action));
                 if resp.double_clicked() {
                     activated = Some(idx);
                 }
@@ -1354,10 +1397,13 @@ impl CyclopsApp {
         let Some(v) = &self.viewer else { return };
         let index = v.index;
         let (delete, rename) = ctx.input(|i| (i.key_pressed(Key::Delete), i.key_pressed(Key::F2)));
+        let edit = ctx.input(|i| i.modifiers.is_none() && i.key_pressed(Key::E));
         if delete {
             self.pending_action = Some(FileAction::Delete(index));
         } else if rename {
             self.pending_action = Some(FileAction::Rename(index));
+        } else if edit {
+            self.pending_action = Some(FileAction::Edit(index));
         }
         let is_video = self.entries.get(index).is_some_and(|e| e.is_video);
         let animated = self.entries.get(index).and_then(|e| match self.full.get(&e.path) {
@@ -1553,7 +1599,8 @@ impl CyclopsApp {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, format!("Could not open image\n{e}"), FontId::proportional(16.0), theme::p().text_dim);
         }
         let mut menu_action = None;
-        resp.context_menu(|ui| file_menu(ui, index, &entry, false, &mut menu_action));
+        let edit_label = self.edit_label();
+        resp.context_menu(|ui| file_menu(ui, &edit_label, index, &entry, false, &mut menu_action));
         if menu_action.is_some() {
             self.pending_action = menu_action;
         }
@@ -1629,7 +1676,8 @@ impl CyclopsApp {
         let img_rect = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y - info_h));
         let resp = ui.interact(img_rect, ui.scope_id().with("preview"), Sense::click_and_drag());
         let mut menu_action = None;
-        resp.context_menu(|ui| file_menu(ui, index, &entry, true, &mut menu_action));
+        let edit_label = self.edit_label();
+        resp.context_menu(|ui| file_menu(ui, &edit_label, index, &entry, true, &mut menu_action));
         if menu_action.is_some() {
             self.pending_action = menu_action;
         }
@@ -1921,7 +1969,7 @@ fn video_badge(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
 }
 
 /// The right-click menu for a file or folder.
-fn file_menu(ui: &mut egui::Ui, index: usize, entry: &Entry, include_open: bool, action: &mut Option<FileAction>) {
+fn file_menu(ui: &mut egui::Ui, edit_label: &str, index: usize, entry: &Entry, include_open: bool, action: &mut Option<FileAction>) {
     let parent = entry.path.parent().map(Path::to_path_buf);
     ui.set_min_width(200.0);
     let mut pick = |a: FileAction, ui: &mut egui::Ui| {
@@ -1930,6 +1978,9 @@ fn file_menu(ui: &mut egui::Ui, index: usize, entry: &Entry, include_open: bool,
     };
     if include_open && ui.add(egui::Button::new("Open").shortcut_text("Enter")).clicked() {
         pick(FileAction::Open(index), ui);
+    }
+    if !entry.is_dir && ui.add(egui::Button::new(edit_label).shortcut_text("E")).clicked() {
+        pick(FileAction::Edit(index), ui);
     }
     if ui.button("Show in Explorer").clicked() {
         pick(FileAction::Reveal(entry.path.clone()), ui);
@@ -1980,6 +2031,13 @@ impl CyclopsApp {
             FileAction::Delete(i) => {
                 if let Some(e) = entry(i) {
                     self.dialog = Some(Dialog::Delete { path: e.path, name: e.name, is_dir: e.is_dir });
+                }
+            }
+            FileAction::Edit(i) => {
+                if let Some(e) = entry(i).filter(|e| !e.is_dir) {
+                    if let Err(err) = crate::editor::open(self.settings.editor.as_deref(), &e.path) {
+                        self.show_toast(&self.ctx.clone(), err);
+                    }
                 }
             }
             FileAction::NewFolder(parent) => match ops::new_folder(&parent) {
@@ -2160,6 +2218,56 @@ impl CyclopsApp {
         self.dialog = Some(Dialog::Rename { path, text, error: None, fresh: true });
     }
 
+    fn edit_label(&self) -> String {
+        match &self.settings.editor {
+            Some(exe) => format!("Edit in {}", crate::editor::name(exe)),
+            None => "Edit".to_owned(),
+        }
+    }
+
+    /// Re-read the current folder and merge changes in place: files edited elsewhere get
+    /// fresh thumbnails/images, new files appear, removed ones go. Unchanged thumbnails stay.
+    fn sync_folder(&mut self) {
+        let Some(folder) = self.folder.clone().filter(|f| !fs::is_remote(f)) else { return };
+        let Ok(mut fresh) = fs::list(&folder) else { return };
+        let mut changed = false;
+        for e in &fresh {
+            match self.entries.iter().find(|o| o.path == e.path) {
+                Some(old) if old.modified == e.modified && old.size == e.size => {}
+                Some(_) => {
+                    self.thumbs.remove(&e.path);
+                    self.full.remove(&e.path);
+                    self.full_lru.retain(|p| p != &e.path);
+                    changed = true;
+                }
+                None => changed = true,
+            }
+        }
+        let gone: Vec<PathBuf> =
+            self.entries.iter().filter(|o| !fresh.iter().any(|e| e.path == o.path)).map(|o| o.path.clone()).collect();
+        if gone.is_empty() && !changed {
+            return;
+        }
+        for path in &gone {
+            self.forget_caches(path);
+        }
+        let selected = self.selected.and_then(|i| self.entries.get(i)).map(|e| e.path.clone());
+        let viewing = self.viewer.as_ref().and_then(|v| self.entries.get(v.index)).map(|e| e.path.clone());
+        fs::sort(&mut fresh, self.sort_key, self.sort_desc);
+        self.entries = fresh;
+        self.selected = selected.and_then(|p| self.entries.iter().position(|e| e.path == p)).or(self.selected.filter(|_| !self.entries.is_empty()).map(|i| i.min(self.entries.len() - 1)));
+        if let Some(path) = viewing {
+            match self.entries.iter().position(|e| e.path == path) {
+                Some(i) => {
+                    if let Some(v) = &mut self.viewer {
+                        v.index = i;
+                    }
+                }
+                None => self.close_viewer(&self.ctx.clone()),
+            }
+        }
+    }
+
     fn show_toast(&mut self, ctx: &egui::Context, message: String) {
         self.toast = Some((message, ctx.input(|i| i.time)));
     }
@@ -2251,6 +2359,12 @@ impl eframe::App for CyclopsApp {
         let ctx = ui.ctx().clone();
         theme::sync(&ctx);
         crate::perflog::ENABLED.store(self.settings.perf_log, std::sync::atomic::Ordering::Relaxed);
+        // Coming back to the window (e.g. from the photo editor): pick up changed files.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if focused && !self.was_focused {
+            self.sync_folder();
+        }
+        self.was_focused = focused;
         self.frame_no += 1;
         self.max_texture_side = ctx.input(|i| i.max_texture_side) as u32;
         if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
@@ -2339,6 +2453,7 @@ impl eframe::App for CyclopsApp {
         storage.set_string("video_volume", self.settings.video_volume.to_string());
         storage.set_string("three_pane", self.settings.three_pane.to_string());
         storage.set_string("perf_log", self.settings.perf_log.to_string());
+        storage.set_string("editor", self.settings.editor.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
         storage.set_string("preview_width", self.settings.preview_width.to_string());
         let places: Vec<String> = self.network_places.iter().map(|p| p.display().to_string()).collect();
         storage.set_string("network_places", places.join("\n"));

@@ -2,6 +2,7 @@
 
 mod app;
 mod decode;
+mod editor;
 mod fs;
 mod hdr_gpu;
 mod icons;
