@@ -48,9 +48,8 @@ multi-threaded decoding (zune-jpeg fast path), neighbour prefetch and a zoom/pan
 | Browser | Enter / double-click                  | Open image or folder      |
 | Browser | Backspace · Alt+← · F5                | Up · Back · Refresh       |
 | Viewer  | → ↓ Space PgDn / ← ↑ Backspace PgUp   | Next / previous image     |
-| Viewer  | Mouse wheel                           | Next / previous image     |
-| Viewer  | Ctrl+wheel · + / -                    | Zoom around cursor        |
-| Viewer  | Drag · double-click                   | Pan · toggle fit / 100%   |
+| Viewer  | Mouse wheel · pinch · + / -           | Smooth zoom around cursor |
+| Viewer  | Left-drag · double-click              | Pan · toggle fit / 100%   |
 | Viewer  | 0 · 1 · F / F11 · Esc                 | Fit · 100% · Fullscreen · Back |
 
 Pass a folder or image path on the command line to open it directly.

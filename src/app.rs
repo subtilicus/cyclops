@@ -43,7 +43,11 @@ struct Viewer {
     /// Points per source pixel; `None` means fit to window.
     zoom: Option<f32>,
     pan: Vec2,
-    wheel_accum: f32,
+    /// Smooth zoom: the scale being animated towards, anchored at `focus`.
+    target: Option<f32>,
+    focus: egui::Pos2,
+    /// Switch back to tracking "fit" once the animation reaches it.
+    fit_when_done: bool,
 }
 
 pub struct CyclopsApp {
@@ -215,7 +219,14 @@ impl CyclopsApp {
     }
 
     fn open_viewer(&mut self, index: usize) {
-        self.viewer = Some(Viewer { index, zoom: None, pan: Vec2::ZERO, wheel_accum: 0.0 });
+        self.viewer = Some(Viewer {
+            index,
+            zoom: None,
+            pan: Vec2::ZERO,
+            target: None,
+            focus: egui::Pos2::ZERO,
+            fit_when_done: false,
+        });
         self.selected = Some(index);
     }
 
@@ -738,14 +749,12 @@ impl CyclopsApp {
         if let Some(v) = &mut self.viewer {
             if fit {
                 v.zoom = None;
+                v.target = None;
                 v.pan = Vec2::ZERO;
             }
             if one {
                 v.zoom = Some(1.0 / ctx.pixels_per_point());
-            }
-            if zoom_in || zoom_out {
-                // Handled in viewer() where the current scale is known.
-                v.wheel_accum = 0.0;
+                v.target = None;
             }
         }
         self.pending_key_zoom = if zoom_in { 1.25 } else if zoom_out { 0.8 } else { 1.0 };
@@ -779,30 +788,75 @@ impl CyclopsApp {
             let fit = if source_size.is_some() { fit } else { (rect.width() / natural.x).min(rect.height() / natural.y) };
             let scale = v.zoom.unwrap_or(fit);
 
-            // Zoom around a focus point (cursor, or centre for keyboard zoom).
-            let wheel_zoom = if resp.hovered() { ctx.input(|i| i.zoom_delta()) } else { 1.0 };
-            let factor = wheel_zoom * self.pending_key_zoom;
-            if (factor - 1.0).abs() > f32::EPSILON && source_size.is_some() {
-                let new_scale = (scale * factor).clamp(fit.min(0.05), 32.0 / ppp);
-                let focus = if wheel_zoom != 1.0 { resp.hover_pos().unwrap_or(rect.center()) } else { rect.center() };
-                let center = rect.center() + v.pan;
-                let new_center = focus - (focus - center) * (new_scale / scale);
-                v.pan = new_center - rect.center();
-                v.zoom = Some(new_scale);
-            }
-            if resp.dragged() {
-                v.pan += resp.drag_delta();
+            let min_scale = fit * 0.5;
+            let max_scale = 32.0 / ppp;
+
+            // Mouse wheel (and touchpad pinch) set a zoom target anchored at the cursor;
+            // the actual scale glides towards it below.
+            let (wheel, pinch) = if resp.hovered() {
+                ctx.input(|i| {
+                    i.events.iter().fold((0.0f32, 1.0f32), |(w, z), e| match e {
+                        egui::Event::MouseWheel { unit, delta, .. } => (
+                            w + match unit {
+                                egui::MouseWheelUnit::Line => delta.y * 50.0,
+                                egui::MouseWheelUnit::Page => delta.y * 500.0,
+                                egui::MouseWheelUnit::Point => delta.y,
+                            },
+                            z,
+                        ),
+                        egui::Event::Zoom(f) => (w, z * f),
+                        _ => (w, z),
+                    })
+                })
+            } else {
+                (0.0, 1.0)
+            };
+            let factor = (wheel * 0.0035).exp() * pinch * self.pending_key_zoom;
+            if (factor - 1.0).abs() > 1e-4 && source_size.is_some() {
+                let base = v.target.unwrap_or(scale);
+                v.target = Some((base * factor).clamp(min_scale, max_scale));
+                v.focus = if wheel != 0.0 || pinch != 1.0 {
+                    resp.hover_pos().unwrap_or(rect.center())
+                } else {
+                    rect.center()
+                };
+                v.fit_when_done = false;
             }
             if resp.double_clicked() {
-                if v.zoom.is_some() {
-                    v.zoom = None;
-                    v.pan = Vec2::ZERO;
-                } else if let Some(p) = resp.interact_pointer_pos() {
-                    let new_scale = 1.0 / ppp;
-                    let center = rect.center();
-                    v.pan = (p - (p - center) * (new_scale / scale)) - center;
-                    v.zoom = Some(new_scale);
+                v.focus = resp.interact_pointer_pos().unwrap_or(rect.center());
+                if v.zoom.is_some() && (scale - fit).abs() > 1e-4 {
+                    v.target = Some(fit);
+                    v.fit_when_done = true;
+                } else {
+                    v.target = Some((1.0 / ppp).max(fit * 2.0).min(max_scale));
+                    v.fit_when_done = false;
                 }
+            }
+
+            if let Some(target) = v.target {
+                let dt = ctx.input(|i| i.stable_dt).min(0.05);
+                // Exponential ease in log space: equal-feeling speed at every zoom level.
+                let t = 1.0 - (-dt * 18.0).exp();
+                let mut new_scale = scale * (target / scale).powf(t);
+                if (new_scale / target - 1.0).abs() < 0.002 {
+                    new_scale = target;
+                    v.target = None;
+                } else {
+                    ctx.request_repaint();
+                }
+                let center = rect.center() + v.pan;
+                let new_center = v.focus - (v.focus - center) * (new_scale / scale);
+                v.pan = new_center - rect.center();
+                v.zoom = Some(new_scale);
+                if v.target.is_none() && v.fit_when_done {
+                    v.zoom = None;
+                    v.fit_when_done = false;
+                }
+            }
+
+            // Left-drag pans.
+            if resp.dragged() {
+                v.pan += resp.drag_delta();
             }
 
             let scale = v.zoom.unwrap_or(fit);
@@ -811,6 +865,9 @@ impl CyclopsApp {
             let max_pan = ((size - rect.size()) / 2.0).max(Vec2::ZERO);
             v.pan = v.pan.clamp(-max_pan, max_pan);
             let draw = Rect::from_center_size(rect.center() + v.pan, size);
+            if max_pan != Vec2::ZERO && resp.hovered() {
+                ctx.set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+            }
             zoom_pct = Some(scale * ppp * 100.0);
 
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -832,43 +889,6 @@ impl CyclopsApp {
             }
         }
         self.pending_key_zoom = 1.0;
-
-        // Plain mouse wheel flips through images, like FastStone.
-        let scroll = if resp.hovered() {
-            ctx.input(|i| {
-                i.events
-                    .iter()
-                    .filter_map(|e| match e {
-                        egui::Event::MouseWheel { unit, delta, modifiers, .. } if !modifiers.ctrl => Some(match unit {
-                            egui::MouseWheelUnit::Line => delta.y * 40.0,
-                            egui::MouseWheelUnit::Page => delta.y * 400.0,
-                            egui::MouseWheelUnit::Point => delta.y,
-                        }),
-                        _ => None,
-                    })
-                    .sum::<f32>()
-            })
-        } else {
-            0.0
-        };
-        if scroll != 0.0 {
-            if let Some(v) = self.viewer.as_mut() {
-                v.wheel_accum += scroll;
-                let step = if v.wheel_accum >= 40.0 {
-                    Some(false)
-                } else if v.wheel_accum <= -40.0 {
-                    Some(true)
-                } else {
-                    None
-                };
-                if let Some(forward) = step {
-                    v.wheel_accum = 0.0;
-                    if let Some(t) = self.step_image(index, forward) {
-                        self.open_viewer(t);
-                    }
-                }
-            }
-        }
 
         if let Some(Full::Failed(e)) = self.full.get(&entry.path) {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, format!("Could not open image\n{e}"), FontId::proportional(16.0), theme::TEXT_DIM);
