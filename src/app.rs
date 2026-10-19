@@ -53,6 +53,10 @@ struct Settings {
     wheel_zooms: bool,
     show_dates: bool,
     show_info_bar: bool,
+    /// Folders | thumbnails | preview, instead of folders | thumbnails.
+    three_pane: bool,
+    /// Width of the preview pane in points.
+    preview_width: f32,
 }
 
 enum Thumb {
@@ -147,6 +151,8 @@ impl CyclopsApp {
             wheel_zooms: flag("wheel_zooms", true),
             show_dates: flag("show_dates", true),
             show_info_bar: flag("show_info_bar", true),
+            three_pane: flag("three_pane", false),
+            preview_width: stored("preview_width").and_then(|s| s.parse().ok()).unwrap_or(460.0),
         };
         theme::install(&cc.egui_ctx);
         cc.egui_ctx.set_theme(settings.skin.preference());
@@ -502,7 +508,15 @@ impl CyclopsApp {
 
     /// Make sure the current image and its neighbours are loaded or loading; evict old ones.
     fn update_full_cache(&mut self) {
-        let Some(index) = self.viewer.as_ref().map(|v| v.index) else { return };
+        // The viewer's image, or the preview pane's selection.
+        let index = match &self.viewer {
+            Some(v) => v.index,
+            None if self.settings.three_pane => match self.selected {
+                Some(i) if self.entries.get(i).is_some_and(|e| !e.is_dir) => i,
+                _ => return,
+            },
+            None => return,
+        };
         let mut wanted = vec![index];
         let (mut fwd, mut back) = (index, index);
         for _ in 0..PREFETCH {
@@ -566,7 +580,7 @@ impl CyclopsApp {
                 self.refresh();
             }
             ui.add_space(6.0);
-            let slider_w = 420.0;
+            let slider_w = 490.0;
             let edit = egui::TextEdit::singleline(&mut self.path_edit)
                 .desired_width(ui.available_width() - slider_w - 16.0)
                 .margin(vec2(8.0, 5.0));
@@ -606,6 +620,15 @@ impl CyclopsApp {
             let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
             icons::paint(ui.painter(), r, Icon::Grid, theme::p().text_dim);
             ui.add(egui::Slider::new(&mut self.thumb_size, 80.0..=320.0).show_value(false));
+            ui.add_space(8.0);
+            if icons::toggle(ui, Icon::TwoPane, !self.settings.three_pane, "Two panes: folders and thumbnails").clicked() {
+                self.settings.three_pane = false;
+            }
+            if icons::toggle(ui, Icon::ThreePane, self.settings.three_pane, "Three panes: folders, thumbnails and preview")
+                .clicked()
+            {
+                self.settings.three_pane = true;
+            }
             ui.add_space(4.0);
             let cog = icons::button(ui, Icon::Cog, true, "Settings");
             egui::Popup::menu(&cog)
@@ -1221,6 +1244,109 @@ impl CyclopsApp {
     }
 }
 
+impl CyclopsApp {
+    /// The draggable border between the thumbnail grid and the preview pane.
+    fn preview_divider(&mut self, ui: &mut egui::Ui, panel: Rect) {
+        let x = panel.min.x;
+        let handle = Rect::from_x_y_ranges(x - 4.0..=x + 4.0, panel.y_range());
+        let resp = ui.interact(handle, ui.scope_id().with("preview_divider"), Sense::drag());
+        if resp.dragged() {
+            self.settings.preview_width -= resp.drag_delta().x;
+            ui.ctx().request_repaint();
+        }
+        let active = resp.hovered() || resp.dragged();
+        if active {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        let stroke = if active { Stroke::new(2.0, theme::p().accent) } else { Stroke::new(1.0, theme::p().border) };
+        ui.painter().vline(x, panel.y_range(), stroke);
+    }
+
+    fn preview(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        // Claim the whole panel; panels size themselves from their content.
+        ui.expand_to_include_rect(rect);
+        let ppp = ui.ctx().pixels_per_point();
+        let Some(index) = self.selected.filter(|&i| i < self.entries.len()) else {
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Nothing selected", FontId::proportional(14.0), theme::p().text_dim);
+            return;
+        };
+        let entry = self.entries[index].clone();
+        let info_h = 64.0;
+        let img_rect = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y - info_h));
+        let resp = ui.interact(img_rect, ui.scope_id().with("preview"), Sense::click());
+        if resp.double_clicked() {
+            self.activate(index);
+        }
+
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        let mut details = Vec::new();
+        if entry.is_dir {
+            let side = img_rect.width().min(img_rect.height()) * 0.35;
+            let icon_rect = Rect::from_center_size(img_rect.center(), vec2(side, side));
+            match self.shell_icon(&entry.path, 256) {
+                Some(tex) => {
+                    ui.painter().image(tex, icon_rect, uv, Color32::WHITE);
+                }
+                None => icons::paint(ui.painter(), icon_rect, Icon::Folder, theme::p().accent),
+            }
+            details.push("Folder".to_owned());
+        } else {
+            // Full image when decoded, the thumbnail (scaled to the final size) until then.
+            let full = match self.full.get(&entry.path) {
+                Some(Full::Ready(img)) => Some((img.source_size, img.main.clone(), img.screen.clone())),
+                _ => None,
+            };
+            let thumb = match self.thumbs.get(&entry.path) {
+                Some(Thumb::Ready { tex, .. }) => Some(tex.clone()),
+                _ => None,
+            };
+            let natural = full.as_ref().map(|f| f.0).or_else(|| thumb.as_ref().map(|t| t.size_vec2()));
+            if let Some(natural) = natural {
+                let mut scale = (img_rect.width() / natural.x).min(img_rect.height() / natural.y);
+                if full.is_some() {
+                    scale = scale.min(1.0 / ppp);
+                }
+                let draw = Rect::from_center_size(img_rect.center(), natural * scale);
+                let tex = match &full {
+                    Some((_, main, screen)) => match screen {
+                        Some(s) if draw.width() * ppp <= s.size_vec2().x * 1.05 => s.id(),
+                        _ => main.id(),
+                    },
+                    None => thumb.as_ref().map_or(egui::TextureId::default(), |t| t.id()),
+                };
+                ui.painter().with_clip_rect(img_rect).image(tex, draw, uv, Color32::WHITE);
+            }
+            if let Some((size, ..)) = &full {
+                details.push(format!("{}×{}", size.x as u32, size.y as u32));
+            } else if let Some(Full::Failed(e)) = self.full.get(&entry.path) {
+                details.push(format!("error: {e}"));
+            }
+            details.push(fs::human_size(entry.size));
+        }
+        if !entry.modified_label.is_empty() {
+            details.push(entry.modified_label.clone());
+        }
+
+        let painter = ui.painter();
+        let mut job = LayoutJob::single_section(
+            entry.name.clone(),
+            TextFormat { font_id: FontId::proportional(14.0), color: theme::p().text_strong, ..Default::default() },
+        );
+        job.wrap = TextWrapping::truncate_at_width(rect.width());
+        let name = painter.layout_job(job);
+        let name_pos = pos2(rect.center().x - name.size().x / 2.0, rect.max.y - info_h + 14.0);
+        painter.galley(name_pos, name, theme::p().text_strong);
+        painter.text(
+            pos2(rect.center().x, rect.max.y - info_h + 38.0),
+            Align2::CENTER_TOP,
+            details.join("  ·  "),
+            FontId::proportional(12.0),
+            theme::p().text_dim,
+        );
+    }
+}
+
 /// Whether `folder` lives in the tree branch below `root`.
 fn under_root(folder: &Path, root: &Path) -> bool {
     if fs::location(root) == fs::Location::Network {
@@ -1265,9 +1391,25 @@ impl eframe::App for CyclopsApp {
                 .size_range(160.0..=500.0)
                 .frame(egui::Frame::NONE.fill(theme::p().panel).inner_margin(egui::Margin::symmetric(6, 8)))
                 .show(ui, |ui| self.folder_tree(ui));
+            // The preview width is owned by us (not egui's panel state) so a drag always sticks.
+            let preview = self.settings.three_pane.then(|| {
+                let max = (ui.available_width() - 260.0).max(220.0);
+                self.settings.preview_width = self.settings.preview_width.clamp(220.0, max);
+                egui::Panel::right("preview_pane")
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .exact_size(self.settings.preview_width)
+                    .frame(egui::Frame::NONE.fill(theme::p().panel).inner_margin(egui::Margin::same(12)))
+                    .show(ui, |ui| self.preview(ui))
+                    .response
+                    .rect
+            });
             egui::CentralPanel::no_frame()
                 .frame(egui::Frame::NONE.fill(theme::p().bg))
                 .show(ui, |ui| self.grid(ui));
+            if let Some(panel) = preview {
+                self.preview_divider(ui, panel);
+            }
         }
         self.evict_thumbs();
     }
@@ -1283,6 +1425,8 @@ impl eframe::App for CyclopsApp {
         storage.set_string("wheel_zooms", self.settings.wheel_zooms.to_string());
         storage.set_string("show_dates", self.settings.show_dates.to_string());
         storage.set_string("show_info_bar", self.settings.show_info_bar.to_string());
+        storage.set_string("three_pane", self.settings.three_pane.to_string());
+        storage.set_string("preview_width", self.settings.preview_width.to_string());
         let places: Vec<String> = self.network_places.iter().map(|p| p.display().to_string()).collect();
         storage.set_string("network_places", places.join("\n"));
     }
