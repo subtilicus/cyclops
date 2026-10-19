@@ -139,7 +139,7 @@ fn worker(
             continue;
         }
         // RAW/HEIC thumbnails: Explorer's cached thumbnail is far faster than a full decode.
-        if job.kind == Kind::Thumb && crate::wic::handles(&job.path) {
+        if job.kind == Kind::Thumb && decode::prefers_shell_thumbnail(&job.path) {
             if let Some(main) = crate::shell::thumbnail_only(&job.path, job.max_side) {
                 let images = Images { source_size: main.size, main, screen: None, frames: Vec::new(), hdr: None, decode_ms: 0.0 };
                 if done_tx.send(Loaded { path: job.path, kind: job.kind, result: Ok(images) }).is_err() {
@@ -170,6 +170,13 @@ fn worker(
             let main = to_color_image(main_img, d.opaque);
             let hdr = if full { d.hdr } else { None };
             Images { main, screen, source_size, frames, hdr, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
+        });
+        crate::perflog::record(|| match &result {
+            Ok(img) => format!(
+                "{:?}  {:>8.1} ms  {}x{}  {}",
+                job.kind, img.decode_ms, img.source_size[0], img.source_size[1], job.path.display()
+            ),
+            Err(e) => format!("{:?}  failed: {e}  {}", job.kind, job.path.display()),
         });
         if done_tx.send(Loaded { path: job.path, kind: job.kind, result }).is_err() {
             return;

@@ -59,6 +59,8 @@ struct Settings {
     video_volume: f32,
     /// Folders | thumbnails | preview, instead of folders | thumbnails.
     three_pane: bool,
+    /// Developer: write decode timings to a log file.
+    perf_log: bool,
     /// Width of the preview pane in points.
     preview_width: f32,
 }
@@ -79,11 +81,12 @@ struct FullImage {
     main: TextureHandle,
     screen: Option<TextureHandle>,
     source_size: Vec2,
-    decode_ms: f32,
     /// Animation frames with durations in seconds (empty for stills).
     frames: Vec<(TextureHandle, f32)>,
     /// When the image became ready; animations play from here.
     ready_at: f64,
+    /// Animation position (seconds) while paused; `None` while playing.
+    paused_at: Option<f32>,
     /// HDR/EXR linear data and the exposure (EV) being shown.
     hdr: Option<HdrEdit>,
 }
@@ -118,19 +121,52 @@ impl FullImage {
     /// The animation frame to show at `now` (scheduling a repaint for the next one),
     /// or `None` for still images.
     fn frame_at(&self, now: f64, ctx: &egui::Context) -> Option<egui::TextureId> {
-        let total: f32 = self.frames.iter().map(|(_, d)| d).sum();
-        if total <= 0.0 {
+        let (index, remaining) = self.frame_index(now)?;
+        if self.paused_at.is_none() {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(remaining));
+        }
+        Some(self.frames[index].0.id())
+    }
+
+    fn anim_duration(&self) -> f32 {
+        self.frames.iter().map(|(_, d)| d).sum()
+    }
+
+    /// Seconds into the animation loop.
+    fn anim_time(&self, now: f64) -> f32 {
+        let total = self.anim_duration().max(1e-3);
+        self.paused_at.unwrap_or_else(|| ((now - self.ready_at) as f32).rem_euclid(total))
+    }
+
+    /// Current frame and the time left until the next one.
+    fn frame_index(&self, now: f64) -> Option<(usize, f32)> {
+        if self.anim_duration() <= 0.0 {
             return None;
         }
-        let mut t = ((now - self.ready_at) as f32).rem_euclid(total);
-        for (tex, duration) in &self.frames {
+        let mut t = self.anim_time(now);
+        for (i, (_, duration)) in self.frames.iter().enumerate() {
             if t < *duration {
-                ctx.request_repaint_after(std::time::Duration::from_secs_f32(duration - t));
-                return Some(tex.id());
+                return Some((i, duration - t));
             }
             t -= duration;
         }
-        self.frames.first().map(|(tex, _)| tex.id())
+        Some((self.frames.len() - 1, 0.0))
+    }
+
+    fn toggle_animation(&mut self, now: f64) {
+        match self.paused_at.take() {
+            Some(t) => self.ready_at = now - t as f64,
+            None => self.paused_at = Some(self.anim_time(now)),
+        }
+    }
+
+    fn seek_animation(&mut self, now: f64, t: f32) {
+        let t = t.clamp(0.0, (self.anim_duration() - 1e-3).max(0.0));
+        if self.paused_at.is_some() {
+            self.paused_at = Some(t);
+        } else {
+            self.ready_at = now - t as f64;
+        }
     }
 }
 
@@ -368,6 +404,7 @@ impl CyclopsApp {
             video_muted: flag("video_muted", false),
             video_volume: stored("video_volume").and_then(|s| s.parse().ok()).unwrap_or(1.0),
             three_pane: flag("three_pane", false),
+            perf_log: flag("perf_log", false),
             preview_width: stored("preview_width").and_then(|s| s.parse().ok()).unwrap_or(460.0),
         };
         theme::install(&cc.egui_ctx);
@@ -707,6 +744,7 @@ impl CyclopsApp {
                                     })
                                     .collect(),
                                 ready_at: ctx.input(|i| i.time),
+                                paused_at: None,
                                 hdr: images.hdr.zip(self.render_state.as_ref()).and_then(|(hdr, rs)| {
                                     let gpu = crate::hdr_gpu::upload(rs, &hdr.levels)?;
                                     Some(HdrEdit { gpu, auto_exposure: hdr.auto_exposure, ev: 0.0 })
@@ -716,7 +754,6 @@ impl CyclopsApp {
                                     .screen
                                     .map(|s| ctx.load_texture(name + "#screen", s, TextureOptions::LINEAR)),
                                 source_size: vec2(images.source_size[0] as f32, images.source_size[1] as f32),
-                                decode_ms: images.decode_ms,
                             }),
                             Err(e) => Full::Failed(e),
                         };
@@ -907,6 +944,15 @@ impl CyclopsApp {
             ui.selectable_value(&mut self.settings.wheel_zooms, false, "Next image");
         });
         ui.checkbox(&mut self.settings.show_info_bar, "Show info bar");
+
+        ui.separator();
+        heading(ui, "DEVELOPER");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.settings.perf_log, "Write performance log");
+            if self.settings.perf_log && ui.small_button("Show file").clicked() {
+                ops::reveal(&crate::perflog::path());
+            }
+        });
 
         ui.separator();
         ui.label(egui::RichText::new(concat!("Cyclops ", env!("CARGO_PKG_VERSION"))).small().color(theme::p().text_dim));
@@ -1286,6 +1332,17 @@ impl CyclopsApp {
             self.pending_action = Some(FileAction::Rename(index));
         }
         let is_video = self.entries.get(index).is_some_and(|e| e.is_video);
+        let animated = self.entries.get(index).and_then(|e| match self.full.get(&e.path) {
+            Some(Full::Ready(img)) if !img.frames.is_empty() => Some(e.path.clone()),
+            _ => None,
+        });
+        if animated.is_some() && ctx.input(|i| i.key_pressed(Key::Space)) {
+            let now = ctx.input(|i| i.time);
+            if let Some(Full::Ready(img)) = animated.as_ref().and_then(|p| self.full.get_mut(p)) {
+                img.toggle_animation(now);
+            }
+        }
+        let plays = is_video || animated.is_some();
         let (play_pause, mute) = ctx.input(|i| (is_video && i.key_pressed(Key::Space), is_video && i.key_pressed(Key::M)));
         if let Some((_, Ok(player))) = &mut self.video {
             if play_pause {
@@ -1300,7 +1357,7 @@ impl CyclopsApp {
             (
                 i.key_pressed(Key::ArrowRight)
                     || i.key_pressed(Key::ArrowDown)
-                    || (!is_video && i.key_pressed(Key::Space))
+                    || (!plays && i.key_pressed(Key::Space))
                     || i.key_pressed(Key::PageDown),
                 i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::Backspace) || i.key_pressed(Key::PageUp),
                 i.key_pressed(Key::Home),
@@ -1387,7 +1444,7 @@ impl CyclopsApp {
             (video_size, status)
         } else {
             match full {
-                Some(Full::Ready(img)) => (Some(img.source_size), format!("{:.0} ms", img.decode_ms)),
+                Some(Full::Ready(img)) => (Some(img.source_size), String::new()),
                 Some(Full::Failed(e)) => (None, format!("error: {e}")),
                 _ => (None, "loading…".to_owned()),
             }
@@ -1476,7 +1533,12 @@ impl CyclopsApp {
             self.exposure_control(ui, rect, &entry.path);
         }
         // Overlay opacity: videos fade their controls (and the info pill) out when the mouse rests.
-        let overlay_alpha = if entry.is_video { self.video_controls(ui, rect) } else { 1.0 };
+        let overlay_alpha = if entry.is_video {
+            self.video_controls(ui, rect)
+        } else {
+            let lift = if self.settings.show_info_bar { 82.0 } else { 38.0 };
+            self.animation_controls(ui, rect, &entry.path, lift)
+        };
 
         if !self.settings.show_info_bar || overlay_alpha <= 0.0 {
             return;
@@ -1492,7 +1554,9 @@ impl CyclopsApp {
         if let Some(z) = zoom_pct {
             info += &format!("    {z:.0}%");
         }
-        info += &format!("    {status}");
+        if !status.is_empty() {
+            info += &format!("    {status}");
+        }
         let mut painter = ui.painter().clone();
         painter.multiply_opacity(overlay_alpha);
         let galley = painter.layout_no_wrap(info, FontId::proportional(13.0), theme::DARK.text);
@@ -1601,6 +1665,7 @@ impl CyclopsApp {
                 }
             }
             self.exposure_control(ui, img_rect, &entry.path);
+            self.animation_controls(ui, img_rect, &entry.path, 30.0);
             if let Some((size, ..)) = &full {
                 details.push(format!("{}×{}", size.x as u32, size.y as u32));
             } else if let Some(Full::Failed(e)) = self.full.get(&entry.path) {
@@ -1634,35 +1699,95 @@ impl CyclopsApp {
 impl CyclopsApp {
     /// Floating glass transport bar: play/pause, time, seek, volume, mute.
     /// Fades out (with the cursor) once the mouse rests while playing; returns its opacity.
-    fn video_controls(&mut self, ui: &mut egui::Ui, rect: Rect) -> f32 {
+    /// Opacity of a transport bar: fully shown while paused, hovered or after mouse activity,
+    /// fading out (and hiding the cursor over `area`) once the mouse rests during playback.
+    fn controls_alpha(&mut self, ctx: &egui::Context, bar: Rect, area: Rect, playing: bool) -> f32 {
         const SHOW_FOR: f64 = 1.6;
         const FADE: f64 = 0.45;
-        let lift = if self.settings.show_info_bar { 86.0 } else { 40.0 };
-        let bar = Rect::from_center_size(pos2(rect.center().x, rect.max.y - lift), vec2((rect.width() - 48.0).min(760.0), 44.0));
-        let ctx = ui.ctx().clone();
         let (now, active, pointer) = ctx.input(|i| {
             (i.time, i.pointer.is_moving() || i.pointer.any_down() || i.pointer.any_pressed(), i.pointer.hover_pos())
         });
         if active {
             self.last_pointer_activity = now;
         }
-        let Some((_, Ok(player))) = &mut self.video else { return 1.0 };
         let over_bar = pointer.is_some_and(|p| bar.expand(12.0).contains(p));
         let idle = now - self.last_pointer_activity;
-        let alpha = if over_bar || !player.is_playing() {
-            1.0
-        } else {
-            (1.0 - ((idle - SHOW_FOR) / FADE).clamp(0.0, 1.0)) as f32
-        };
+        let alpha = if over_bar || !playing { 1.0 } else { (1.0 - ((idle - SHOW_FOR) / FADE).clamp(0.0, 1.0)) as f32 };
         if alpha <= 0.0 {
-            ctx.set_cursor_icon(egui::CursorIcon::None);
-            return 0.0;
-        }
-        if alpha < 1.0 {
+            if pointer.is_some_and(|p| area.contains(p)) {
+                ctx.set_cursor_icon(egui::CursorIcon::None);
+            }
+        } else if alpha < 1.0 {
             ctx.request_repaint();
-        } else if !over_bar && player.is_playing() {
+        } else if !over_bar && playing {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64((SHOW_FOR - idle).max(0.0)));
         }
+        alpha
+    }
+
+    /// Play/pause, frame counter and scrub bar for animated GIF/WebP/APNG; returns its opacity.
+    fn animation_controls(&mut self, ui: &mut egui::Ui, area: Rect, path: &Path, lift: f32) -> f32 {
+        let playing = match self.full.get(path) {
+            Some(Full::Ready(img)) if !img.frames.is_empty() => img.paused_at.is_none(),
+            _ => return 1.0,
+        };
+        let ctx = ui.ctx().clone();
+        let bar = Rect::from_center_size(pos2(area.center().x, area.max.y - lift), vec2((area.width() - 32.0).min(560.0), 40.0));
+        let alpha = self.controls_alpha(&ctx, bar, area, playing);
+        if alpha <= 0.0 {
+            return 0.0;
+        }
+        let Some(Full::Ready(img)) = self.full.get_mut(path) else { return alpha };
+        let now = ctx.input(|i| i.time);
+        let mut painter = ui.painter().clone();
+        painter.multiply_opacity(alpha);
+        painter.rect(bar, CornerRadius::same(14), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
+        let (fg, cy) = (theme::DARK.text, bar.center().y);
+
+        let play = Rect::from_center_size(pos2(bar.min.x + 24.0, cy), vec2(30.0, 30.0));
+        let play_resp = ui.interact(play, ui.scope_id().with(("anim-play", path)), Sense::click());
+        if play_resp.hovered() {
+            painter.rect_filled(play, CornerRadius::same(8), Color32::from_white_alpha(20));
+        }
+        icons::paint(&painter, play.shrink(8.0), if playing { Icon::Pause } else { Icon::Play }, if play_resp.hovered() { Color32::WHITE } else { fg });
+        if play_resp.clicked() {
+            img.toggle_animation(now);
+        }
+
+        let (index, _) = img.frame_index(now).unwrap_or((0, 0.0));
+        let counter = painter.layout_no_wrap(format!("{} / {}", index + 1, img.frames.len()), FontId::monospace(12.0), fg);
+        let counter_x = bar.max.x - 14.0 - counter.size().x;
+        painter.galley(pos2(counter_x, cy - counter.size().y / 2.0), counter, fg);
+
+        let track = Rect::from_min_max(pos2(bar.min.x + 48.0, cy - 2.5), pos2(counter_x - 14.0, cy + 2.5));
+        if track.width() > 20.0 {
+            let total = img.anim_duration();
+            let seek = ui.interact(track.expand2(vec2(6.0, 12.0)), ui.scope_id().with(("anim-seek", path)), Sense::click_and_drag());
+            if seek.dragged() || seek.clicked() {
+                if let Some(p) = seek.interact_pointer_pos() {
+                    img.seek_animation(now, ((p.x - track.min.x) / track.width()).clamp(0.0, 1.0) * total);
+                    ctx.request_repaint();
+                }
+            }
+            let frac = (img.anim_time(now) / total.max(1e-3)).clamp(0.0, 1.0);
+            let knob_x = track.min.x + track.width() * frac;
+            painter.rect_filled(track, CornerRadius::same(3), Color32::from_white_alpha(40));
+            painter.rect_filled(Rect::from_min_max(track.min, pos2(knob_x, track.max.y)), CornerRadius::same(3), theme::DARK.accent);
+            painter.circle_filled(pos2(knob_x, cy), if seek.hovered() || seek.dragged() { 7.0 } else { 5.5 }, Color32::WHITE);
+        }
+        alpha
+    }
+
+    fn video_controls(&mut self, ui: &mut egui::Ui, rect: Rect) -> f32 {
+        let lift = if self.settings.show_info_bar { 86.0 } else { 40.0 };
+        let bar = Rect::from_center_size(pos2(rect.center().x, rect.max.y - lift), vec2((rect.width() - 48.0).min(760.0), 44.0));
+        let ctx = ui.ctx().clone();
+        let playing = matches!(&self.video, Some((_, Ok(p))) if p.is_playing());
+        let alpha = self.controls_alpha(&ctx, bar, rect, playing);
+        if alpha <= 0.0 {
+            return 0.0;
+        }
+        let Some((_, Ok(player))) = &mut self.video else { return 1.0 };
 
         let mut painter = ui.painter().clone();
         painter.multiply_opacity(alpha);
@@ -2048,6 +2173,7 @@ impl eframe::App for CyclopsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         theme::sync(&ctx);
+        crate::perflog::ENABLED.store(self.settings.perf_log, std::sync::atomic::Ordering::Relaxed);
         self.frame_no += 1;
         self.max_texture_side = ctx.input(|i| i.max_texture_side) as u32;
         if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
@@ -2135,6 +2261,7 @@ impl eframe::App for CyclopsApp {
         storage.set_string("video_muted", self.settings.video_muted.to_string());
         storage.set_string("video_volume", self.settings.video_volume.to_string());
         storage.set_string("three_pane", self.settings.three_pane.to_string());
+        storage.set_string("perf_log", self.settings.perf_log.to_string());
         storage.set_string("preview_width", self.settings.preview_width.to_string());
         let places: Vec<String> = self.network_places.iter().map(|p| p.display().to_string()).collect();
         storage.set_string("network_places", places.join("\n"));

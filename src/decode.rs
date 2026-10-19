@@ -77,10 +77,14 @@ impl Decoded {
 pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Result<Decoded, String> {
     let ext = extension(path);
     if crate::wic::handles(path) {
-        let wic = crate::wic::decode(path, max_side).map_err(|e| codec_hint(&ext, e))?;
-        let image = apply_orientation(wic.image, wic.orientation);
-        let opaque = is_opaque(&image);
-        return Ok(Decoded { image, opaque, source_size: wic.source_size, frames: Vec::new(), hdr: None });
+        return from_wic(path, max_side).map_err(|e| codec_hint(&ext, e));
+    }
+    // TIFFs are often huge (scans, satellite, print). WIC scales while decoding, so a
+    // 120-megapixel file never needs a full-size buffer; fall back to `image` if WIC can't.
+    if ext == "tif" || ext == "tiff" {
+        if let Ok(d) = from_wic(path, max_side) {
+            return Ok(d);
+        }
     }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     match ext.as_str() {
@@ -102,9 +106,34 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
             return Ok(Decoded { image, opaque: false, source_size, frames, hdr: None });
         }
     }
-    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    let img = match load_unlimited(&bytes) {
+        Ok(img) => img,
+        // Unusual variants (e.g. exotic TIFF compressions) may still be readable by Windows.
+        Err(e) => return from_wic(path, max_side).map_err(|_| e),
+    };
     let opaque = !img.color().has_alpha();
     Ok(Decoded::still(img.to_rgba8(), opaque))
+}
+
+/// Formats whose grid thumbnails should come from Explorer's cache before decoding ourselves
+/// (large or slow to decode).
+pub fn prefers_shell_thumbnail(path: &Path) -> bool {
+    crate::wic::handles(path) || matches!(extension(path).as_str(), "tif" | "tiff" | "psd" | "exr" | "hdr")
+}
+
+fn from_wic(path: &Path, max_side: u32) -> Result<Decoded, String> {
+    let wic = crate::wic::decode(path, max_side)?;
+    let image = apply_orientation(wic.image, wic.orientation);
+    let opaque = is_opaque(&image);
+    Ok(Decoded { image, opaque, source_size: wic.source_size, frames: Vec::new(), hdr: None })
+}
+
+/// `image::load_from_memory` without the default 512 MB allocation cap: big images are
+/// legitimate here, and they are downscaled right after decoding.
+fn load_unlimited(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string())?;
+    reader.no_limits();
+    reader.decode().map_err(|e| e.to_string())
 }
 
 /// Point at the free Store codec when Windows can't decode a format.
@@ -277,7 +306,7 @@ fn hdr_mips(pixels: Vec<f32>, size: [u32; 2]) -> Vec<HdrLevel> {
 /// thumbnails and as a fallback) plus, with `keep_linear`, the data for GPU tone mapping,
 /// scaled to at most `max_side`.
 fn decode_hdr(bytes: &[u8], max_side: u32, keep_linear: bool) -> Result<Decoded, String> {
-    let mut img = image::load_from_memory(bytes).map_err(|e| e.to_string())?.into_rgba32f();
+    let mut img = load_unlimited(bytes)?.into_rgba32f();
     let (w, h) = img.dimensions();
     if w.max(h) > max_side {
         let scale = max_side as f32 / w.max(h) as f32;

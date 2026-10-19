@@ -7,6 +7,7 @@ mod hdr_gpu;
 mod icons;
 mod loader;
 mod ops;
+mod perflog;
 mod shell;
 mod theme;
 mod video;
