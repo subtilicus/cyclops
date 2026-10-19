@@ -8,6 +8,7 @@ use crate::theme;
 pub enum Icon {
     Back,
     Up,
+    Down,
     Refresh,
     ChevronRight,
     ChevronDown,
@@ -35,6 +36,10 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Up => {
             line(&[p(8.0, 13.0), p(8.0, 3.5)]);
             line(&[p(4.0, 7.5), p(8.0, 3.5), p(12.0, 7.5)]);
+        }
+        Icon::Down => {
+            line(&[p(8.0, 3.0), p(8.0, 12.5)]);
+            line(&[p(4.0, 8.5), p(8.0, 12.5), p(12.0, 8.5)]);
         }
         Icon::Refresh => {
             let c = p(8.0, 8.0);

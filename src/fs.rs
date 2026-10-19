@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::decode::is_image;
 
@@ -11,6 +12,34 @@ pub struct Entry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
+    pub modified: Option<SystemTime>,
+    /// Pre-formatted local modification time, so tiles don't format every frame.
+    pub modified_label: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortKey {
+    Name,
+    Modified,
+    Size,
+    Type,
+}
+
+impl SortKey {
+    pub const ALL: [Self; 4] = [Self::Name, Self::Modified, Self::Size, Self::Type];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Modified => "Date modified",
+            Self::Size => "Size",
+            Self::Type => "Type",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.label() == label)
+    }
 }
 
 /// Places shown at the top of the folder tree.
@@ -80,11 +109,32 @@ pub fn list(dir: &Path) -> std::io::Result<Vec<Entry>> {
             if is_hidden(&path, &name) || !(is_dir || is_image(&path)) {
                 return None;
             }
-            Some(Entry { path, name, is_dir, size: meta.len() })
+            let modified = meta.modified().ok();
+            let modified_label = modified.map(format_time).unwrap_or_default();
+            Some(Entry { path, name, is_dir, size: meta.len(), modified, modified_label })
         })
         .collect();
-    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| natural_cmp(&a.name, &b.name)));
+    sort(&mut entries, SortKey::Name, false);
     Ok(entries)
+}
+
+/// Folders always come first; ties fall back to natural name order.
+pub fn sort(entries: &mut [Entry], key: SortKey, descending: bool) {
+    let ext = |e: &Entry| e.path.extension().map(|x| x.to_string_lossy().to_lowercase()).unwrap_or_default();
+    entries.sort_by(|a, b| {
+        let ord = match key {
+            SortKey::Name => Ordering::Equal,
+            SortKey::Modified => a.modified.cmp(&b.modified),
+            SortKey::Size => a.size.cmp(&b.size),
+            SortKey::Type => ext(a).cmp(&ext(b)),
+        }
+        .then_with(|| natural_cmp(&a.name, &b.name));
+        b.is_dir.cmp(&a.is_dir).then(if descending { ord.reverse() } else { ord })
+    });
+}
+
+pub fn format_time(t: SystemTime) -> String {
+    chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M").to_string()
 }
 
 pub fn file_name(p: &Path) -> String {

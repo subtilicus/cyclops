@@ -7,7 +7,7 @@ use egui::{
     Vec2, pos2, vec2,
 };
 
-use crate::fs::{self, Entry};
+use crate::fs::{self, Entry, SortKey};
 use crate::icons::{self, Icon};
 use crate::loader::{Kind, Loader};
 use crate::theme;
@@ -59,6 +59,8 @@ pub struct CyclopsApp {
     list_error: Option<String>,
     selected: Option<usize>,
     history: Vec<PathBuf>,
+    sort_key: SortKey,
+    sort_desc: bool,
 
     thumb_size: f32,
     thumbs: HashMap<PathBuf, Thumb>,
@@ -84,6 +86,8 @@ impl CyclopsApp {
 
         let stored = |key: &str| cc.storage.and_then(|s| s.get_string(key));
         let thumb_size = stored("thumb_size").and_then(|s| s.parse().ok()).unwrap_or(160.0);
+        let sort_key = stored("sort_key").and_then(|s| SortKey::from_label(&s)).unwrap_or(SortKey::Name);
+        let sort_desc = stored("sort_desc").is_some_and(|s| s == "true");
         let last_folder = stored("last_folder").map(PathBuf::from).filter(|p| p.is_dir());
 
         let roots = fs::roots();
@@ -99,6 +103,8 @@ impl CyclopsApp {
             list_error: None,
             selected: None,
             history: Vec::new(),
+            sort_key,
+            sort_desc,
             thumb_size,
             thumbs: HashMap::new(),
             grid_cols: 1,
@@ -153,7 +159,8 @@ impl CyclopsApp {
         self.viewer = None;
         self.selected = None;
         match fs::list(&folder) {
-            Ok(entries) => {
+            Ok(mut entries) => {
+                fs::sort(&mut entries, self.sort_key, self.sort_desc);
                 self.entries = entries;
                 self.list_error = None;
             }
@@ -171,6 +178,14 @@ impl CyclopsApp {
         self.path_edit = folder.display().to_string();
         self.folder = Some(folder);
         self.scroll_tree_to_folder = true;
+        self.scroll_to_selected = true;
+    }
+
+    /// Re-sort the current listing, keeping the selected item selected and in view.
+    fn resort(&mut self) {
+        let selected = self.selected.and_then(|i| self.entries.get(i)).map(|e| e.path.clone());
+        fs::sort(&mut self.entries, self.sort_key, self.sort_desc);
+        self.selected = selected.and_then(|p| self.entries.iter().position(|e| e.path == p));
         self.scroll_to_selected = true;
     }
 
@@ -346,7 +361,7 @@ impl CyclopsApp {
                 }
             }
             ui.add_space(6.0);
-            let slider_w = 180.0;
+            let slider_w = 380.0;
             let edit = egui::TextEdit::singleline(&mut self.path_edit)
                 .desired_width(ui.available_width() - slider_w - 16.0)
                 .margin(vec2(8.0, 5.0));
@@ -363,6 +378,23 @@ impl CyclopsApp {
                         self.open_viewer(i);
                     }
                 }
+            }
+            ui.add_space(8.0);
+            let before = (self.sort_key, self.sort_desc);
+            egui::ComboBox::from_id_salt("sort")
+                .selected_text(self.sort_key.label())
+                .width(130.0)
+                .show_ui(ui, |ui| {
+                    for key in SortKey::ALL {
+                        ui.selectable_value(&mut self.sort_key, key, key.label());
+                    }
+                });
+            let (dir_icon, dir_tip) = if self.sort_desc { (Icon::Down, "Descending") } else { (Icon::Up, "Ascending") };
+            if icons::button(ui, dir_icon, true, dir_tip).clicked() {
+                self.sort_desc = !self.sort_desc;
+            }
+            if before != (self.sort_key, self.sort_desc) {
+                self.resort();
             }
             ui.add_space(8.0);
             let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
@@ -495,7 +527,7 @@ impl CyclopsApp {
     }
 
     fn cell_size(&self) -> Vec2 {
-        vec2(self.thumb_size + 12.0, self.thumb_size + 34.0)
+        vec2(self.thumb_size + 12.0, self.thumb_size + 50.0)
     }
 
     fn grid(&mut self, ui: &mut egui::Ui) {
@@ -626,8 +658,18 @@ impl CyclopsApp {
         );
         job.wrap = TextWrapping::truncate_at_width(label_w);
         let galley = painter.layout_job(job);
-        let pos = pos2(rect.center().x - galley.size().x / 2.0, rect.max.y - 22.0);
+        let pos = pos2(rect.center().x - galley.size().x / 2.0, rect.max.y - 38.0);
         painter.galley(pos, galley, theme::TEXT_DIM);
+        if !entry.modified_label.is_empty() {
+            let color = if selected { theme::TEXT } else { theme::TEXT_DIM.gamma_multiply(0.75) };
+            painter.text(
+                pos2(rect.center().x, rect.max.y - 10.0),
+                Align2::CENTER_BOTTOM,
+                &entry.modified_label,
+                FontId::proportional(11.0),
+                color,
+            );
+        }
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
@@ -640,6 +682,9 @@ impl CyclopsApp {
                 let mut text = e.name.clone();
                 if !e.is_dir {
                     text += &format!("  ·  {}", fs::human_size(e.size));
+                }
+                if !e.modified_label.is_empty() {
+                    text += &format!("  ·  {}", e.modified_label);
                 }
                 ui.label(egui::RichText::new(text).small());
             }
@@ -898,6 +943,8 @@ impl eframe::App for CyclopsApp {
             storage.set_string("last_folder", f.display().to_string());
         }
         storage.set_string("thumb_size", self.thumb_size.to_string());
+        storage.set_string("sort_key", self.sort_key.label().to_owned());
+        storage.set_string("sort_desc", self.sort_desc.to_string());
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

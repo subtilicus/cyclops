@@ -10,6 +10,7 @@ keywords = ["image", "viewer", "browser", "gpu", "wgpu"]
 categories = ["multimedia::images", "graphics"]
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 crossbeam-channel = "0.5.17"
 eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
 egui = "0.37"
