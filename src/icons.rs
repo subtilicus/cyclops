@@ -16,6 +16,7 @@ pub enum Icon {
     Drive,
     Grid,
     Warning,
+    Cog,
 }
 
 /// Paint `icon` centred in `rect`, drawn on a 16×16 design grid scaled to fit.
@@ -75,6 +76,16 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 painter.rect_stroke(r, CornerRadius::same((1.5 * s) as u8), stroke, egui::StrokeKind::Middle);
             }
         }
+        Icon::Cog => {
+            let c = p(8.0, 8.0);
+            let teeth = Stroke::new(2.6 * s, color);
+            for i in 0..8 {
+                let dir = Vec2::angled(i as f32 * std::f32::consts::FRAC_PI_4);
+                painter.line_segment([c + dir * 4.8 * s, c + dir * 7.0 * s], teeth);
+            }
+            painter.circle_stroke(c, 4.6 * s, stroke);
+            painter.circle_stroke(c, 1.9 * s, stroke);
+        }
         Icon::Warning => {
             let tri = vec![p(8.0, 2.0), p(15.0, 14.0), p(1.0, 14.0)];
             painter.add(Shape::convex_polygon(tri, Color32::TRANSPARENT, stroke));
@@ -92,15 +103,15 @@ pub fn button(ui: &mut Ui, icon: Icon, enabled: bool, tooltip: &str) -> Response
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if enabled && (resp.hovered() || resp.is_pointer_button_down_on()) {
-            let fill = if resp.is_pointer_button_down_on() { theme::ACCENT_SOFT } else { theme::SURFACE_HOVER };
+            let fill = if resp.is_pointer_button_down_on() { theme::p().accent_soft } else { theme::p().surface_hover };
             painter.rect_filled(rect, CornerRadius::same(6), fill);
         }
         let color = if !enabled {
-            theme::TEXT_DIM.gamma_multiply(0.5)
+            theme::p().text_dim.gamma_multiply(0.5)
         } else if resp.hovered() {
-            Color32::WHITE
+            theme::p().text_strong
         } else {
-            theme::TEXT
+            theme::p().text
         };
         paint(painter, Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), icon, color);
     }

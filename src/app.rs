@@ -20,6 +20,41 @@ const MAX_LIVE_THUMBS: usize = 3000;
 const FULL_CACHE: usize = 8;
 const PREFETCH: usize = 2;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Skin {
+    System,
+    Dark,
+    Light,
+}
+
+impl Skin {
+    const ALL: [Self; 3] = [Self::System, Self::Dark, Self::Light];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
+
+    fn preference(self) -> egui::ThemePreference {
+        match self {
+            Self::System => egui::ThemePreference::System,
+            Self::Dark => egui::ThemePreference::Dark,
+            Self::Light => egui::ThemePreference::Light,
+        }
+    }
+}
+
+struct Settings {
+    skin: Skin,
+    /// Viewer mouse wheel zooms (true) or flips between images (false).
+    wheel_zooms: bool,
+    show_dates: bool,
+    show_info_bar: bool,
+}
+
 enum Thumb {
     Pending,
     Ready { tex: TextureHandle, last_used: u64 },
@@ -50,11 +85,14 @@ struct Viewer {
     focus: egui::Pos2,
     /// Switch back to tracking "fit" once the animation reaches it.
     fit_when_done: bool,
+    /// Wheel travel accumulated towards the next image (when the wheel navigates).
+    wheel_accum: f32,
 }
 
 pub struct CyclopsApp {
     loader: Loader,
     ctx: egui::Context,
+    settings: Settings,
     roots: Vec<(String, PathBuf)>,
     tree_children: HashMap<PathBuf, Vec<PathBuf>>,
     /// Remote folders whose children are being enumerated on a background thread.
@@ -102,10 +140,18 @@ pub struct CyclopsApp {
 
 impl CyclopsApp {
     pub fn new(cc: &eframe::CreationContext<'_>, start: Option<PathBuf>) -> Self {
-        theme::apply(&cc.egui_ctx);
+        let stored = |key: &str| cc.storage.and_then(|s| s.get_string(key));
+        let flag = |key: &str, default: bool| stored(key).map_or(default, |s| s == "true");
+        let settings = Settings {
+            skin: stored("skin").and_then(|s| Skin::ALL.into_iter().find(|k| k.label() == s)).unwrap_or(Skin::Dark),
+            wheel_zooms: flag("wheel_zooms", true),
+            show_dates: flag("show_dates", true),
+            show_info_bar: flag("show_info_bar", true),
+        };
+        theme::install(&cc.egui_ctx);
+        cc.egui_ctx.set_theme(settings.skin.preference());
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
-        let stored = |key: &str| cc.storage.and_then(|s| s.get_string(key));
         let thumb_size = stored("thumb_size").and_then(|s| s.parse().ok()).unwrap_or(160.0);
         let sort_key = stored("sort_key").and_then(|s| SortKey::from_label(&s)).unwrap_or(SortKey::Name);
         let sort_desc = stored("sort_desc").is_some_and(|s| s == "true");
@@ -117,6 +163,7 @@ impl CyclopsApp {
         let mut app = Self {
             loader: Loader::new(cc.egui_ctx.clone()),
             ctx: cc.egui_ctx.clone(),
+            settings,
             roots,
             tree_children: HashMap::new(),
             children_loading: HashSet::new(),
@@ -357,6 +404,7 @@ impl CyclopsApp {
             target: None,
             focus: egui::Pos2::ZERO,
             fit_when_done: false,
+            wheel_accum: 0.0,
         });
         self.selected = Some(index);
     }
@@ -518,7 +566,7 @@ impl CyclopsApp {
                 self.refresh();
             }
             ui.add_space(6.0);
-            let slider_w = 380.0;
+            let slider_w = 420.0;
             let edit = egui::TextEdit::singleline(&mut self.path_edit)
                 .desired_width(ui.available_width() - slider_w - 16.0)
                 .margin(vec2(8.0, 5.0));
@@ -556,16 +604,76 @@ impl CyclopsApp {
             }
             ui.add_space(8.0);
             let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-            icons::paint(ui.painter(), r, Icon::Grid, theme::TEXT_DIM);
+            icons::paint(ui.painter(), r, Icon::Grid, theme::p().text_dim);
             ui.add(egui::Slider::new(&mut self.thumb_size, 80.0..=320.0).show_value(false));
+            ui.add_space(4.0);
+            let cog = icons::button(ui, Icon::Cog, true, "Settings");
+            egui::Popup::menu(&cog)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .align(egui::RectAlign::BOTTOM_END)
+                .gap(6.0)
+                .show(|ui| self.settings_menu(ui));
         });
+    }
+
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_width(260.0);
+        let heading = |ui: &mut egui::Ui, text: &str| {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(text).small().strong().color(theme::p().text_dim));
+        };
+
+        heading(ui, "SKIN");
+        ui.horizontal(|ui| {
+            let before = self.settings.skin;
+            for skin in Skin::ALL {
+                ui.selectable_value(&mut self.settings.skin, skin, skin.label());
+            }
+            if before != self.settings.skin {
+                ui.ctx().set_theme(self.settings.skin.preference());
+            }
+        });
+
+        ui.separator();
+        heading(ui, "THUMBNAILS");
+        ui.horizontal(|ui| {
+            ui.label("Size");
+            ui.add(egui::Slider::new(&mut self.thumb_size, 80.0..=320.0).suffix(" px").integer());
+        });
+        ui.checkbox(&mut self.settings.show_dates, "Show file date");
+
+        ui.separator();
+        heading(ui, "VIEWER");
+        ui.horizontal(|ui| {
+            ui.label("Mouse wheel");
+            ui.selectable_value(&mut self.settings.wheel_zooms, true, "Zoom");
+            ui.selectable_value(&mut self.settings.wheel_zooms, false, "Next image");
+        });
+        ui.checkbox(&mut self.settings.show_info_bar, "Show info bar");
+
+        ui.separator();
+        ui.label(egui::RichText::new(concat!("Cyclops ", env!("CARGO_PKG_VERSION"))).small().color(theme::p().text_dim));
     }
 
     fn folder_tree(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
+            // Shortcuts, drives and network form three groups separated by a divider.
+            let group = |p: &Path| match fs::location(p) {
+                fs::Location::Network => 2,
+                _ if p.parent().is_none() => 1,
+                _ => 0,
+            };
             let roots = self.roots.clone();
+            let mut last_group = None;
             for (label, path) in &roots {
+                let g = group(path);
+                if last_group.is_some_and(|last| last != g) {
+                    ui.add_space(3.0);
+                    ui.separator();
+                    ui.add_space(3.0);
+                }
+                last_group = Some(g);
                 self.tree_node(ui, path, path, label, 0);
             }
         });
@@ -587,20 +695,20 @@ impl CyclopsApp {
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
             if is_current {
-                painter.rect_filled(rect, CornerRadius::same(6), theme::ACCENT_SOFT);
+                painter.rect_filled(rect, CornerRadius::same(6), theme::p().accent_soft);
             } else if resp.hovered() {
-                painter.rect_filled(rect, CornerRadius::same(6), theme::SURFACE_HOVER);
+                painter.rect_filled(rect, CornerRadius::same(6), theme::p().surface_hover);
             }
             let chevron_icon = if expanded { Icon::ChevronDown } else { Icon::ChevronRight };
-            icons::paint(painter, chevron.shrink(2.0), chevron_icon, theme::TEXT_DIM);
+            icons::paint(painter, chevron.shrink(2.0), chevron_icon, theme::p().text_dim);
             let icon_rect = Rect::from_min_size(pos2(chevron.max.x + 4.0, rect.min.y + 4.0), vec2(16.0, 16.0));
             if let Some(tex) = shell_tex {
                 painter.image(tex, icon_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             } else {
-                let (icon, icon_color) = if depth == 0 { (Icon::Drive, theme::TEXT_DIM) } else { (Icon::Folder, theme::ACCENT) };
+                let (icon, icon_color) = if depth == 0 { (Icon::Drive, theme::p().text_dim) } else { (Icon::Folder, theme::p().accent) };
                 icons::paint(painter, icon_rect, icon, icon_color);
             }
-            let color = if is_current { Color32::WHITE } else { theme::TEXT };
+            let color = if is_current { theme::p().text_strong } else { theme::p().text };
             let galley = painter.layout_no_wrap(label.to_owned(), FontId::proportional(13.5), color);
             let text_pos = pos2(icon_rect.max.x + 7.0, rect.center().y - galley.size().y / 2.0);
             painter.with_clip_rect(rect).galley(text_pos, galley, color);
@@ -629,8 +737,8 @@ impl CyclopsApp {
                 None => {
                     ui.horizontal(|ui| {
                         ui.add_space(4.0 + (depth + 1) as f32 * 14.0 + 20.0);
-                        ui.add(egui::Spinner::new().size(12.0).color(theme::TEXT_DIM));
-                        ui.label(egui::RichText::new("Searching…").color(theme::TEXT_DIM).small());
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::p().text_dim));
+                        ui.label(egui::RichText::new("Searching…").color(theme::p().text_dim).small());
                     });
                 }
             }
@@ -706,13 +814,13 @@ impl CyclopsApp {
 
     fn grid(&mut self, ui: &mut egui::Ui) {
         if let Some(err) = &self.list_error {
-            ui.centered_and_justified(|ui| ui.label(egui::RichText::new(err.clone()).color(theme::TEXT_DIM)));
+            ui.centered_and_justified(|ui| ui.label(egui::RichText::new(err.clone()).color(theme::p().text_dim)));
             return;
         }
         if self.entries.is_empty() {
             let searching = self.folder.as_ref().is_some_and(|f| self.children_loading.contains(f));
             let text = if searching { "Searching the network…" } else { "No images here" };
-            ui.centered_and_justified(|ui| ui.label(egui::RichText::new(text).color(theme::TEXT_DIM)));
+            ui.centered_and_justified(|ui| ui.label(egui::RichText::new(text).color(theme::p().text_dim)));
             return;
         }
 
@@ -795,11 +903,11 @@ impl CyclopsApp {
         let radius = CornerRadius::same(8);
 
         let (fill, stroke) = if selected {
-            (theme::ACCENT_SOFT, Stroke::new(1.5, theme::ACCENT))
+            (theme::p().accent_soft, Stroke::new(1.5, theme::p().accent))
         } else if hovered {
-            (theme::SURFACE_HOVER, Stroke::new(1.0, theme::BORDER))
+            (theme::p().surface_hover, Stroke::new(1.0, theme::p().border))
         } else {
-            (theme::SURFACE, Stroke::NONE)
+            (theme::p().surface, Stroke::NONE)
         };
         painter.rect(rect, radius, fill, stroke, egui::StrokeKind::Inside);
 
@@ -811,7 +919,7 @@ impl CyclopsApp {
                 Some(tex) => {
                     painter.image(tex, icon_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 }
-                None => icons::paint(painter, icon_rect, Icon::Folder, theme::ACCENT),
+                None => icons::paint(painter, icon_rect, Icon::Folder, theme::p().accent),
             }
         } else {
             let state = self.thumbs.entry(entry.path.clone()).or_insert_with(|| {
@@ -827,10 +935,10 @@ impl CyclopsApp {
                     painter.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                 }
                 Thumb::Pending => {
-                    painter.rect_filled(img_area.shrink(img_area.width() * 0.12), CornerRadius::same(6), theme::BG.gamma_multiply(0.6));
+                    painter.rect_filled(img_area.shrink(img_area.width() * 0.12), CornerRadius::same(6), theme::p().bg.gamma_multiply(0.6));
                 }
                 Thumb::Failed => {
-                    icons::paint(painter, Rect::from_center_size(img_area.center(), vec2(28.0, 28.0)), Icon::Warning, theme::TEXT_DIM);
+                    icons::paint(painter, Rect::from_center_size(img_area.center(), vec2(28.0, 28.0)), Icon::Warning, theme::p().text_dim);
                 }
             }
         }
@@ -840,16 +948,16 @@ impl CyclopsApp {
             entry.name.clone(),
             TextFormat {
                 font_id: FontId::proportional(12.0),
-                color: if selected { Color32::WHITE } else { theme::TEXT_DIM },
+                color: if selected { theme::p().text_strong } else { theme::p().text_dim },
                 ..Default::default()
             },
         );
         job.wrap = TextWrapping::truncate_at_width(label_w);
         let galley = painter.layout_job(job);
         let pos = pos2(rect.center().x - galley.size().x / 2.0, rect.max.y - 38.0);
-        painter.galley(pos, galley, theme::TEXT_DIM);
-        if !entry.modified_label.is_empty() {
-            let color = if selected { theme::TEXT } else { theme::TEXT_DIM.gamma_multiply(0.75) };
+        painter.galley(pos, galley, theme::p().text_dim);
+        if self.settings.show_dates && !entry.modified_label.is_empty() {
+            let color = if selected { theme::p().text } else { theme::p().text_dim.gamma_multiply(0.75) };
             painter.text(
                 pos2(rect.center().x, rect.max.y - 10.0),
                 Align2::CENTER_BOTTOM,
@@ -864,7 +972,7 @@ impl CyclopsApp {
         ui.horizontal(|ui| {
             let dirs = self.entries.iter().filter(|e| e.is_dir).count();
             let images = self.entries.len() - dirs;
-            ui.label(egui::RichText::new(format!("{images} images · {dirs} folders")).color(theme::TEXT_DIM).small());
+            ui.label(egui::RichText::new(format!("{images} images · {dirs} folders")).color(theme::p().text_dim).small());
             if let Some(e) = self.selected.and_then(|i| self.entries.get(i)) {
                 ui.separator();
                 let mut text = e.name.clone();
@@ -958,6 +1066,28 @@ impl CyclopsApp {
         };
         let natural = source_size.or_else(|| thumb.as_ref().map(|t| t.size_vec2()));
 
+        // Wheel input, split by Ctrl: Ctrl+wheel always zooms; the plain wheel follows the setting.
+        let (wheel_plain, wheel_ctrl, pinch) = if resp.hovered() {
+            ctx.input(|i| {
+                i.events.iter().fold((0.0f32, 0.0f32, 1.0f32), |(w, c, z), e| match e {
+                    egui::Event::MouseWheel { unit, delta, modifiers, .. } => {
+                        let d = match unit {
+                            egui::MouseWheelUnit::Line => delta.y * 50.0,
+                            egui::MouseWheelUnit::Page => delta.y * 500.0,
+                            egui::MouseWheelUnit::Point => delta.y,
+                        };
+                        if modifiers.ctrl { (w, c + d, z) } else { (w + d, c, z) }
+                    }
+                    egui::Event::Zoom(f) => (w, c, z * f),
+                    _ => (w, c, z),
+                })
+            })
+        } else {
+            (0.0, 0.0, 1.0)
+        };
+        let (wheel, wheel_nav) =
+            if self.settings.wheel_zooms { (wheel_plain + wheel_ctrl, 0.0) } else { (wheel_ctrl, wheel_plain) };
+
         let mut zoom_pct = None;
         if let (Some(natural), Some(v)) = (natural, self.viewer.as_mut()) {
             // Fit, but never upscale small images beyond 100% (1 source px = 1 screen px).
@@ -968,26 +1098,7 @@ impl CyclopsApp {
             let min_scale = fit * 0.5;
             let max_scale = 32.0 / ppp;
 
-            // Mouse wheel (and touchpad pinch) set a zoom target anchored at the cursor;
-            // the actual scale glides towards it below.
-            let (wheel, pinch) = if resp.hovered() {
-                ctx.input(|i| {
-                    i.events.iter().fold((0.0f32, 1.0f32), |(w, z), e| match e {
-                        egui::Event::MouseWheel { unit, delta, .. } => (
-                            w + match unit {
-                                egui::MouseWheelUnit::Line => delta.y * 50.0,
-                                egui::MouseWheelUnit::Page => delta.y * 500.0,
-                                egui::MouseWheelUnit::Point => delta.y,
-                            },
-                            z,
-                        ),
-                        egui::Event::Zoom(f) => (w, z * f),
-                        _ => (w, z),
-                    })
-                })
-            } else {
-                (0.0, 1.0)
-            };
+            // Wheel and pinch set a zoom target anchored at the cursor; the scale glides towards it.
             let factor = (wheel * 0.0035).exp() * pinch * self.pending_key_zoom;
             if (factor - 1.0).abs() > 1e-4 && source_size.is_some() {
                 let base = v.target.unwrap_or(scale);
@@ -1067,11 +1178,27 @@ impl CyclopsApp {
         }
         self.pending_key_zoom = 1.0;
 
-        if let Some(Full::Failed(e)) = self.full.get(&entry.path) {
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, format!("Could not open image\n{e}"), FontId::proportional(16.0), theme::TEXT_DIM);
+        if wheel_nav != 0.0 {
+            if let Some(v) = self.viewer.as_mut() {
+                v.wheel_accum += wheel_nav;
+                if v.wheel_accum.abs() >= 40.0 {
+                    let forward = v.wheel_accum < 0.0;
+                    v.wheel_accum = 0.0;
+                    if let Some(t) = self.step_image(index, forward) {
+                        self.open_viewer(t);
+                    }
+                }
+            }
         }
 
-        // Floating glass info pill.
+        if let Some(Full::Failed(e)) = self.full.get(&entry.path) {
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, format!("Could not open image\n{e}"), FontId::proportional(16.0), theme::p().text_dim);
+        }
+
+        if !self.settings.show_info_bar {
+            return;
+        }
+        // Floating glass info pill (always dark, it sits on top of the photo).
         let pos_in_folder = self.entries[..=index].iter().filter(|e| !e.is_dir).count();
         let total = self.entries.iter().filter(|e| !e.is_dir).count();
         let mut info = format!("{}    {}/{}", entry.name, pos_in_folder, total);
@@ -1084,13 +1211,13 @@ impl CyclopsApp {
         }
         info += &format!("    {status}");
         let painter = ui.painter();
-        let galley = painter.layout_no_wrap(info, FontId::proportional(13.0), theme::TEXT);
+        let galley = painter.layout_no_wrap(info, FontId::proportional(13.0), theme::DARK.text);
         let pill = Rect::from_center_size(
             pos2(rect.center().x, rect.max.y - 30.0),
             galley.size() + vec2(28.0, 14.0),
         );
         painter.rect(pill, CornerRadius::same(255), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
-        painter.galley(pill.min + vec2(14.0, 7.0), galley, theme::TEXT);
+        painter.galley(pill.min + vec2(14.0, 7.0), galley, theme::DARK.text);
     }
 }
 
@@ -1106,6 +1233,7 @@ fn under_root(folder: &Path, root: &Path) -> bool {
 impl eframe::App for CyclopsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        theme::sync(&ctx);
         self.frame_no += 1;
         self.max_texture_side = ctx.input(|i| i.max_texture_side) as u32;
         if let Some(m) = ctx.input(|i| i.viewport().monitor_size) {
@@ -1122,23 +1250,23 @@ impl eframe::App for CyclopsApp {
 
         if self.viewer.is_some() {
             egui::CentralPanel::no_frame()
-                .frame(egui::Frame::NONE.fill(Color32::from_rgb(8, 8, 10)))
+                .frame(egui::Frame::NONE.fill(theme::p().viewer_bg))
                 .show(ui, |ui| self.viewer(ui));
         } else {
             egui::Panel::top("toolbar")
-                .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(10, 8)))
+                .frame(egui::Frame::NONE.fill(theme::p().panel).inner_margin(egui::Margin::symmetric(10, 8)))
                 .show(ui, |ui| self.toolbar(ui));
             egui::Panel::bottom("status")
-                .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(12, 4)))
+                .frame(egui::Frame::NONE.fill(theme::p().panel).inner_margin(egui::Margin::symmetric(12, 4)))
                 .show(ui, |ui| self.status_bar(ui));
             egui::Panel::left("tree")
                 .resizable(true)
                 .default_size(250.0)
                 .size_range(160.0..=500.0)
-                .frame(egui::Frame::NONE.fill(theme::PANEL).inner_margin(egui::Margin::symmetric(6, 8)))
+                .frame(egui::Frame::NONE.fill(theme::p().panel).inner_margin(egui::Margin::symmetric(6, 8)))
                 .show(ui, |ui| self.folder_tree(ui));
             egui::CentralPanel::no_frame()
-                .frame(egui::Frame::NONE.fill(theme::BG))
+                .frame(egui::Frame::NONE.fill(theme::p().bg))
                 .show(ui, |ui| self.grid(ui));
         }
         self.evict_thumbs();
@@ -1151,11 +1279,15 @@ impl eframe::App for CyclopsApp {
         storage.set_string("thumb_size", self.thumb_size.to_string());
         storage.set_string("sort_key", self.sort_key.label().to_owned());
         storage.set_string("sort_desc", self.sort_desc.to_string());
+        storage.set_string("skin", self.settings.skin.label().to_owned());
+        storage.set_string("wheel_zooms", self.settings.wheel_zooms.to_string());
+        storage.set_string("show_dates", self.settings.show_dates.to_string());
+        storage.set_string("show_info_bar", self.settings.show_info_bar.to_string());
         let places: Vec<String> = self.network_places.iter().map(|p| p.display().to_string()).collect();
         storage.set_string("network_places", places.join("\n"));
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        theme::BG.to_normalized_gamma_f32()
+        theme::p().bg.to_normalized_gamma_f32()
     }
 }
