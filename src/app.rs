@@ -89,9 +89,16 @@ struct FullImage {
 }
 
 struct HdrEdit {
-    data: crate::decode::Hdr,
+    gpu: crate::hdr_gpu::HdrTexture,
+    auto_exposure: f32,
+    /// Stops relative to auto exposure.
     ev: f32,
-    shown_ev: f32,
+}
+
+impl HdrEdit {
+    fn exposure(&self) -> f32 {
+        self.auto_exposure * 2f32.powf(self.ev)
+    }
 }
 
 /// A file command picked from a menu or shortcut; applied after the frame's UI is drawn.
@@ -290,6 +297,8 @@ struct Viewer {
 pub struct CyclopsApp {
     loader: Loader,
     ctx: egui::Context,
+    /// eframe's wgpu state, for custom GPU drawing (HDR tone mapping).
+    render_state: Option<eframe::egui_wgpu::RenderState>,
     settings: Settings,
     roots: Vec<(String, PathBuf)>,
     tree_children: HashMap<PathBuf, Vec<PathBuf>>,
@@ -362,6 +371,9 @@ impl CyclopsApp {
             preview_width: stored("preview_width").and_then(|s| s.parse().ok()).unwrap_or(460.0),
         };
         theme::install(&cc.egui_ctx);
+        if let Some(rs) = &cc.wgpu_render_state {
+            crate::hdr_gpu::init(rs);
+        }
         cc.egui_ctx.set_theme(settings.skin.preference());
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
@@ -376,6 +388,7 @@ impl CyclopsApp {
         let mut app = Self {
             loader: Loader::new(cc.egui_ctx.clone()),
             ctx: cc.egui_ctx.clone(),
+            render_state: cc.wgpu_render_state.clone(),
             settings,
             roots,
             tree_children: HashMap::new(),
@@ -694,7 +707,10 @@ impl CyclopsApp {
                                     })
                                     .collect(),
                                 ready_at: ctx.input(|i| i.time),
-                                hdr: images.hdr.map(|data| HdrEdit { data, ev: 0.0, shown_ev: 0.0 }),
+                                hdr: images.hdr.zip(self.render_state.as_ref()).and_then(|(hdr, rs)| {
+                                    let gpu = crate::hdr_gpu::upload(rs, &hdr.levels)?;
+                                    Some(HdrEdit { gpu, auto_exposure: hdr.auto_exposure, ev: 0.0 })
+                                }),
                                 main: ctx.load_texture(name.clone(), images.main, TextureOptions::LINEAR),
                                 screen: images
                                     .screen
@@ -1423,7 +1439,13 @@ impl CyclopsApp {
                     None => egui::TextureId::default(),
                 },
             };
-            if tex_id != egui::TextureId::default() {
+            let hdr_shape = match self.full.get(&entry.path) {
+                Some(Full::Ready(FullImage { hdr: Some(h), .. })) => h.gpu.paint(draw, rect, h.exposure()),
+                _ => None,
+            };
+            if let Some(shape) = hdr_shape {
+                ui.painter().add(shape);
+            } else if tex_id != egui::TextureId::default() {
                 ui.painter().with_clip_rect(rect).image(tex_id, draw, uv, Color32::WHITE);
             }
         }
@@ -1565,7 +1587,18 @@ impl CyclopsApp {
                     },
                     None => thumb.as_ref().map_or(egui::TextureId::default(), |t| t.id()),
                 };
-                ui.painter().with_clip_rect(img_rect).image(tex, draw, uv, Color32::WHITE);
+                let hdr_shape = match self.full.get(&entry.path) {
+                    Some(Full::Ready(FullImage { hdr: Some(h), .. })) => h.gpu.paint(draw, img_rect, h.exposure()),
+                    _ => None,
+                };
+                match hdr_shape {
+                    Some(shape) => {
+                        ui.painter().add(shape);
+                    }
+                    None => {
+                        ui.painter().with_clip_rect(img_rect).image(tex, draw, uv, Color32::WHITE);
+                    }
+                }
             }
             self.exposure_control(ui, img_rect, &entry.path);
             if let Some((size, ..)) = &full {
@@ -1949,12 +1982,12 @@ impl CyclopsApp {
 
     /// Glass exposure slider for HDR/EXR images, at the top of `area`.
     fn exposure_control(&mut self, ui: &mut egui::Ui, area: Rect, path: &Path) {
-        const RANGE: f32 = 4.0;
-        let Some(Full::Ready(img)) = self.full.get_mut(path) else { return };
-        let Some(hdr) = &mut img.hdr else { return };
+        // ±8 EV: 16 stops around auto exposure.
+        const RANGE: f32 = 8.0;
+        let Some(Full::Ready(FullImage { hdr: Some(hdr), .. })) = self.full.get_mut(path) else { return };
         let painter = ui.painter().clone();
         let fg = theme::DARK.text;
-        let pill = Rect::from_center_size(pos2(area.center().x, area.min.y + 30.0), vec2(360.0, 36.0));
+        let pill = Rect::from_center_size(pos2(area.center().x, area.min.y + 30.0), vec2(480.0_f32.min(area.width() - 24.0), 36.0));
         painter.rect(pill, CornerRadius::same(12), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
         let cy = pill.center().y;
         painter.text(pos2(pill.min.x + 14.0, cy), Align2::LEFT_CENTER, "Exposure", FontId::proportional(12.5), fg);
@@ -1997,13 +2030,6 @@ impl CyclopsApp {
             hdr.ev = 0.0;
         }
 
-        if (hdr.ev - hdr.shown_ev).abs() > 1e-3 {
-            let rgba = hdr.data.tonemap(hdr.ev);
-            let size = [rgba.width() as usize, rgba.height() as usize];
-            img.main.set(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), TextureOptions::LINEAR);
-            img.screen = None;
-            hdr.shown_ev = hdr.ev;
-        }
     }
 }
 

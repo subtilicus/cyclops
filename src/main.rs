@@ -3,6 +3,7 @@
 mod app;
 mod decode;
 mod fs;
+mod hdr_gpu;
 mod icons;
 mod loader;
 mod ops;
