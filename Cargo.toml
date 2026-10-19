@@ -1,0 +1,18 @@
+[package]
+name = "cyclops"
+version = "0.1.0"
+edition = "2021"
+description = "A blazing-fast, GPU-accelerated image browser with a modern glass UI"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/subtilicus/cyclops"
+readme = "README.md"
+keywords = ["image", "viewer", "browser", "gpu", "wgpu"]
+categories = ["multimedia::images", "graphics"]
+
+[dependencies]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
