@@ -700,7 +700,8 @@ impl CyclopsApp {
     }
 
     fn cell_size(&self) -> Vec2 {
-        vec2(self.thumb_size + 12.0, self.thumb_size + 50.0)
+        // Square tiles; the name and date sit inside the bottom of the square.
+        Vec2::splat(self.thumb_size + 12.0)
     }
 
     fn grid(&mut self, ui: &mut egui::Ui) {
@@ -802,7 +803,7 @@ impl CyclopsApp {
         };
         painter.rect(rect, radius, fill, stroke, egui::StrokeKind::Inside);
 
-        let img_area = Rect::from_min_size(rect.min + vec2(6.0, 6.0), vec2(rect.width() - 12.0, self.thumb_size - 0.0));
+        let img_area = Rect::from_min_max(rect.min + vec2(6.0, 6.0), pos2(rect.max.x - 6.0, rect.max.y - 46.0));
         if entry.is_dir {
             let side = self.thumb_size * 0.45;
             let icon_rect = Rect::from_center_size(img_area.center(), vec2(side, side));
