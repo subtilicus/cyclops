@@ -33,6 +33,20 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// Create "New folder" (or "New folder (2)", …) inside `parent`, returning its path.
+pub fn new_folder(parent: &Path) -> Result<PathBuf, String> {
+    for n in 1..1000 {
+        let name = if n == 1 { "New folder".to_owned() } else { format!("New folder ({n})") };
+        let path = parent.join(name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Couldn't create folder: {e}")),
+        }
+    }
+    Err("Couldn't find a free folder name".into())
+}
+
 /// Open Explorer with `path` selected.
 pub fn reveal(path: &Path) {
     #[cfg(windows)]
@@ -86,5 +100,25 @@ mod imp {
 
     pub fn recycle(path: &Path) -> Result<(), String> {
         if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) }.map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_folder_picks_free_names() {
+        let dir = std::env::temp_dir().join(format!("cyclops-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = new_folder(&dir).unwrap();
+        let b = new_folder(&dir).unwrap();
+        assert_eq!(a.file_name().unwrap(), "New folder");
+        assert_eq!(b.file_name().unwrap(), "New folder (2)");
+        let renamed = rename(&b, "Holiday").unwrap();
+        assert!(renamed.is_dir());
+        assert!(rename(&a, "Holiday").is_err(), "must refuse to overwrite");
+        assert!(rename(&a, "bad:name").is_err(), "must reject invalid characters");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

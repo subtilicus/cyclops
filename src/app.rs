@@ -110,6 +110,8 @@ enum FileAction {
     Reveal(PathBuf),
     Rename(usize),
     Delete(usize),
+    /// Create a folder inside this one and start renaming it.
+    NewFolder(PathBuf),
 }
 
 enum Dialog {
@@ -1028,12 +1030,23 @@ impl CyclopsApp {
             self.navigate(path.to_path_buf());
         }
         if !fs::is_virtual(path) {
+            let mut action = None;
             resp.context_menu(|ui| {
+                if ui.button("New folder").clicked() {
+                    action = Some(FileAction::NewFolder(path.to_path_buf()));
+                    ui.close();
+                }
                 if ui.button("Show in Explorer").clicked() {
                     ops::reveal(path);
                     ui.close();
                 }
             });
+            if action.is_some() {
+                // Create it in the folder that was right-clicked, keeping that branch of the tree.
+                self.tree_root = Some(root.to_path_buf());
+                self.expanded.insert((root.to_path_buf(), path.to_path_buf()));
+                self.pending_action = action;
+            }
         }
         if is_current && self.scroll_tree_to_folder {
             resp.scroll_to_me(Some(egui::Align::Center));
@@ -1097,6 +1110,11 @@ impl CyclopsApp {
             self.selected = Some(m);
             self.scroll_to_selected = true;
         }
+        if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(Key::N)) {
+            if let Some(folder) = self.folder.clone().filter(|f| !fs::is_virtual(f)) {
+                self.pending_action = Some(FileAction::NewFolder(folder));
+            }
+        }
         if let Some(sel) = self.selected {
             let (delete, rename) = ctx.input(|i| (i.key_pressed(Key::Delete), i.key_pressed(Key::F2)));
             if delete {
@@ -1132,6 +1150,16 @@ impl CyclopsApp {
     }
 
     fn grid(&mut self, ui: &mut egui::Ui) {
+        // Right-clicking empty space acts on the current folder. Registered before the tiles,
+        // so tiles (added later, on top) keep their own menus.
+        if let Some(folder) = self.folder.clone().filter(|f| !fs::is_virtual(f) && self.list_error.is_none()) {
+            let bg = ui.interact(ui.max_rect(), ui.scope_id().with("grid-background"), Sense::click());
+            let mut action = None;
+            bg.context_menu(|ui| folder_menu(ui, &folder, &mut action));
+            if action.is_some() {
+                self.pending_action = action;
+            }
+        }
         if let Some(err) = &self.list_error {
             ui.centered_and_justified(|ui| ui.label(egui::RichText::new(err.clone()).color(theme::p().text_dim)));
             return;
@@ -1894,6 +1922,7 @@ fn video_badge(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
 
 /// The right-click menu for a file or folder.
 fn file_menu(ui: &mut egui::Ui, index: usize, entry: &Entry, include_open: bool, action: &mut Option<FileAction>) {
+    let parent = entry.path.parent().map(Path::to_path_buf);
     ui.set_min_width(200.0);
     let mut pick = |a: FileAction, ui: &mut egui::Ui| {
         *action = Some(a);
@@ -1915,6 +1944,25 @@ fn file_menu(ui: &mut egui::Ui, index: usize, entry: &Entry, include_open: bool,
     if ui.add(egui::Button::new("Delete…").shortcut_text("Del")).clicked() {
         pick(FileAction::Delete(index), ui);
     }
+    if let Some(parent) = parent {
+        ui.separator();
+        if ui.add(egui::Button::new("New folder").shortcut_text("Ctrl+Shift+N")).clicked() {
+            pick(FileAction::NewFolder(parent), ui);
+        }
+    }
+}
+
+/// Right-click menu for empty space in the grid (acts on the current folder).
+fn folder_menu(ui: &mut egui::Ui, folder: &Path, action: &mut Option<FileAction>) {
+    ui.set_min_width(200.0);
+    if ui.add(egui::Button::new("New folder").shortcut_text("Ctrl+Shift+N")).clicked() {
+        *action = Some(FileAction::NewFolder(folder.to_path_buf()));
+        ui.close();
+    }
+    if ui.button("Show in Explorer").clicked() {
+        *action = Some(FileAction::Reveal(folder.to_path_buf()));
+        ui.close();
+    }
 }
 
 impl CyclopsApp {
@@ -1934,6 +1982,10 @@ impl CyclopsApp {
                     self.dialog = Some(Dialog::Delete { path: e.path, name: e.name, is_dir: e.is_dir });
                 }
             }
+            FileAction::NewFolder(parent) => match ops::new_folder(&parent) {
+                Ok(path) => self.folder_created(&parent, path),
+                Err(e) => self.show_toast(&self.ctx.clone(), e),
+            },
         }
     }
 
@@ -2081,6 +2133,31 @@ impl CyclopsApp {
             v.index = i;
         }
         self.scroll_to_selected = true;
+    }
+
+    /// Show a just-created folder (in the grid and tree) and open the rename box for it.
+    fn folder_created(&mut self, parent: &Path, path: PathBuf) {
+        self.tree_children.remove(parent);
+        if let Some(root) = self.tree_root.clone() {
+            self.expanded.insert((root, parent.to_path_buf()));
+        }
+        if self.folder.as_deref() == Some(parent) {
+            let modified = std::time::SystemTime::now();
+            self.entries.push(Entry {
+                name: fs::file_name(&path),
+                path: path.clone(),
+                is_dir: true,
+                is_video: false,
+                size: 0,
+                modified: Some(modified),
+                modified_label: fs::format_time(modified),
+            });
+            fs::sort(&mut self.entries, self.sort_key, self.sort_desc);
+            self.selected = self.entries.iter().position(|e| e.path == path);
+            self.scroll_to_selected = true;
+        }
+        let text = fs::file_name(&path);
+        self.dialog = Some(Dialog::Rename { path, text, error: None, fresh: true });
     }
 
     fn show_toast(&mut self, ctx: &egui::Context, message: String) {
