@@ -21,6 +21,12 @@ pub fn network_children(path: &str) -> Vec<(String, PathBuf)> {
     imp::network_children(path)
 }
 
+/// Explorer's thumbnail for a file (used for videos). Blocks; call from a worker thread.
+pub fn thumbnail(path: &std::path::Path, px: u32) -> Option<ColorImage> {
+    imp::init_com_mta();
+    imp::item_image(&path.to_string_lossy(), px, false)
+}
+
 pub struct IconLoader {
     tx: Sender<(PathBuf, u32)>,
     rx: Receiver<(PathBuf, u32, Option<ColorImage>)>,
@@ -65,7 +71,7 @@ mod imp {
         BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits, GetObjectW,
         HGDIOBJ, ReleaseDC,
     };
-    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree};
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
     use windows::Win32::System::SystemServices::SFGAO_FILESYSTEM;
     use windows::Win32::UI::Shell::*;
     use windows::core::{GUID, HSTRING, PWSTR};
@@ -73,6 +79,12 @@ mod imp {
     pub fn init_com() {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+    }
+
+    pub fn init_com_mta() {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
     }
 
@@ -144,11 +156,16 @@ mod imp {
     }
 
     pub fn item_icon(path: &str, px: u32) -> Option<ColorImage> {
+        item_image(path, px, true)
+    }
+
+    pub fn item_image(path: &str, px: u32, icon_only: bool) -> Option<ColorImage> {
         unsafe {
             let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(path), None).ok()?;
             let factory: IShellItemImageFactory = windows::core::Interface::cast(&item).ok()?;
             let size = SIZE { cx: px as i32, cy: px as i32 };
-            let hbmp = factory.GetImage(size, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
+            let flags = if icon_only { SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK } else { SIIGBF_BIGGERSIZEOK };
+            let hbmp = factory.GetImage(size, flags).ok()?;
             let obj = HGDIOBJ(hbmp.0);
             let mut bm = BITMAP::default();
             let ok = GetObjectW(obj, size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut _)) != 0;
@@ -206,7 +223,13 @@ mod imp {
         Vec::new()
     }
 
+    pub fn init_com_mta() {}
+
     pub fn item_icon(_path: &str, _px: u32) -> Option<ColorImage> {
+        None
+    }
+
+    pub fn item_image(_path: &str, _px: u32, _icon_only: bool) -> Option<ColorImage> {
         None
     }
 }

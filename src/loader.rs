@@ -27,6 +27,8 @@ struct Job {
     screen_side: u32,
 }
 
+const THUMB_SIDE_CAP: u32 = 512;
+
 pub struct Loaded {
     pub path: PathBuf,
     pub kind: Kind,
@@ -113,6 +115,23 @@ fn worker(
             continue;
         }
         let start = Instant::now();
+        if decode::is_video(&job.path) {
+            // Videos get Explorer's thumbnail (a representative frame) for tiles and previews.
+            let side = job.max_side.min(if job.kind == Kind::Full { 1280 } else { THUMB_SIDE_CAP });
+            let result = crate::shell::thumbnail(&job.path, side)
+                .map(|main| Images {
+                    source_size: main.size,
+                    main,
+                    screen: None,
+                    decode_ms: start.elapsed().as_secs_f32() * 1000.0,
+                })
+                .ok_or_else(|| "no thumbnail".to_owned());
+            if done_tx.send(Loaded { path: job.path, kind: job.kind, result }).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+            continue;
+        }
         let result = decode::decode(&job.path).map(|d| {
             let source_size = [d.image.width() as usize, d.image.height() as usize];
             let main_img = decode::fit_within(d.image, job.max_side);

@@ -7,6 +7,7 @@ mod icons;
 mod loader;
 mod shell;
 mod theme;
+mod video;
 
 use std::path::PathBuf;
 

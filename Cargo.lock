@@ -498,6 +498,7 @@ dependencies = [
  "egui",
  "image",
  "windows",
+ "windows-core",
  "zune-core",
  "zune-jpeg",
 ]

@@ -51,9 +51,13 @@ multi-threaded decoding (zune-jpeg fast path), neighbour prefetch and a zoom/pan
 | Viewer  | Mouse wheel · pinch · + / -           | Smooth zoom around cursor |
 | Viewer  | Left-drag · double-click              | Pan · toggle fit / 100%   |
 | Viewer  | 0 · 1 · F / F11 · Esc                 | Fit · 100% · Fullscreen · Back |
+| Video   | Space · M                             | Play/pause · Mute         |
 
 Pass a folder or image path on the command line to open it directly. Network: browse via the
 Network node, or type `\\server` or `\\server\share` in the path bar; visited servers are remembered.
+
+Video (mp4, mov, mkv, wmv, avi, webm, …) plays through Windows Media Foundation: the OS codecs
+decode on the GPU, so Cyclops bundles no codecs and carries no codec licensing obligations.
 
 ## Building
 

@@ -12,6 +12,21 @@ pub const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "gif", "bmp", "webp", "tif", "tiff",
 ];
 
+pub const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mov", "wmv", "avi", "mkv", "webm", "3gp", "3g2", "mts", "m2ts", "ts", "mpg", "mpeg",
+];
+
+pub fn is_video(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| VIDEO_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+/// Anything the browser lists: images and videos.
+pub fn is_media(path: &Path) -> bool {
+    is_image(path) || is_video(path)
+}
+
 pub fn is_image(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())

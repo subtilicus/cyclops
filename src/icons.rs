@@ -19,6 +19,11 @@ pub enum Icon {
     Cog,
     TwoPane,
     ThreePane,
+    Sort,
+    Play,
+    Pause,
+    Volume,
+    Mute,
 }
 
 /// Paint `icon` centred in `rect`, drawn on a 16×16 design grid scaled to fit.
@@ -94,6 +99,33 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             let dividers: &[f32] = if matches!(icon, Icon::TwoPane) { &[6.0] } else { &[5.5, 10.5] };
             for &x in dividers {
                 line(&[p(x, 2.5), p(x, 13.5)]);
+            }
+        }
+        Icon::Sort => {
+            for (y, len) in [(4.0, 12.0), (8.0, 8.5), (12.0, 5.0)] {
+                line(&[p(2.0, y), p(2.0 + len, y)]);
+            }
+        }
+        Icon::Play => {
+            painter.add(Shape::convex_polygon(vec![p(4.5, 2.5), p(13.5, 8.0), p(4.5, 13.5)], color, Stroke::NONE));
+        }
+        Icon::Pause => {
+            for x in [4.0, 9.5] {
+                painter.rect_filled(Rect::from_min_size(p(x, 3.0), vec2(2.8, 10.0) * s), CornerRadius::same(1), color);
+            }
+        }
+        Icon::Volume | Icon::Mute => {
+            let speaker = vec![p(1.5, 6.0), p(4.5, 6.0), p(8.5, 2.5), p(8.5, 13.5), p(4.5, 10.0), p(1.5, 10.0)];
+            painter.add(Shape::convex_polygon(speaker, color, Stroke::NONE));
+            if matches!(icon, Icon::Mute) {
+                line(&[p(10.5, 5.5), p(14.5, 10.5)]);
+                line(&[p(14.5, 5.5), p(10.5, 10.5)]);
+            } else {
+                let c = p(8.5, 8.0);
+                for r in [3.0, 5.5] {
+                    let pts: Vec<Pos2> = (0..=10).map(|i| c + r * s * Vec2::angled((-45.0 + i as f32 * 9.0f32).to_radians())).collect();
+                    painter.add(Shape::line(pts, stroke));
+                }
             }
         }
         Icon::Warning => {

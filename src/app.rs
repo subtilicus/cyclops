@@ -13,6 +13,7 @@ use crate::icons::{self, Icon};
 use crate::loader::{Kind, Loader};
 use crate::shell::{self, IconLoader};
 use crate::theme;
+use crate::video::{self, VideoPlayer};
 
 /// Thumbnails are decoded at this size and scaled on the GPU for display.
 const THUMB_DECODE_SIDE: u32 = 320;
@@ -53,6 +54,7 @@ struct Settings {
     wheel_zooms: bool,
     show_dates: bool,
     show_info_bar: bool,
+    video_muted: bool,
     /// Folders | thumbnails | preview, instead of folders | thumbnails.
     three_pane: bool,
     /// Width of the preview pane in points.
@@ -161,6 +163,8 @@ pub struct CyclopsApp {
     full_lru: VecDeque<PathBuf>,
     fullscreen: bool,
     pending_key_zoom: f32,
+    /// The video playing in the viewer (path it was opened for, player or error).
+    video: Option<(PathBuf, Result<VideoPlayer, String>)>,
 
     frame_no: u64,
     max_texture_side: u32,
@@ -176,6 +180,7 @@ impl CyclopsApp {
             wheel_zooms: flag("wheel_zooms", true),
             show_dates: flag("show_dates", true),
             show_info_bar: flag("show_info_bar", true),
+            video_muted: flag("video_muted", false),
             three_pane: flag("three_pane", false),
             preview_width: stored("preview_width").and_then(|s| s.parse().ok()).unwrap_or(460.0),
         };
@@ -227,6 +232,7 @@ impl CyclopsApp {
             full_lru: VecDeque::new(),
             fullscreen: false,
             pending_key_zoom: 1.0,
+            video: None,
             frame_no: 0,
             max_texture_side: 8192,
             screen_side: 2560,
@@ -624,6 +630,8 @@ impl CyclopsApp {
             }
             ui.add_space(8.0);
             let before = (self.sort_key, self.sort_desc);
+            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+            icons::paint(ui.painter(), r, Icon::Sort, theme::p().text_dim);
             egui::ComboBox::from_id_salt("sort")
                 .selected_text(self.sort_key.label())
                 .width(130.0)
@@ -979,6 +987,9 @@ impl CyclopsApp {
                     let scale = (img_area.width() / size.x).min(img_area.height() / size.y).min(1.0);
                     let r = Rect::from_center_size(img_area.center(), size * scale);
                     painter.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                    if entry.is_video {
+                        video_badge(painter, r.max - vec2(14.0, 14.0), 10.0);
+                    }
                 }
                 Thumb::Pending => {
                     painter.rect_filled(img_area.shrink(img_area.width() * 0.12), CornerRadius::same(6), theme::p().bg.gamma_multiply(0.6));
@@ -1017,8 +1028,14 @@ impl CyclopsApp {
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let dirs = self.entries.iter().filter(|e| e.is_dir).count();
-            let images = self.entries.len() - dirs;
-            ui.label(egui::RichText::new(format!("{images} images · {dirs} folders")).color(theme::p().text_dim).small());
+            let videos = self.entries.iter().filter(|e| e.is_video).count();
+            let images = self.entries.len() - dirs - videos;
+            let mut counts = format!("{images} images");
+            if videos > 0 {
+                counts += &format!(" · {videos} videos");
+            }
+            counts += &format!(" · {dirs} folders");
+            ui.label(egui::RichText::new(counts).color(theme::p().text_dim).small());
             if let Some(e) = self.selected.and_then(|i| self.entries.get(i)) {
                 ui.separator();
                 let mut text = e.name.clone();
@@ -1038,9 +1055,23 @@ impl CyclopsApp {
     fn viewer_input(&mut self, ctx: &egui::Context) {
         let Some(v) = &self.viewer else { return };
         let index = v.index;
+        let is_video = self.entries.get(index).is_some_and(|e| e.is_video);
+        let (play_pause, mute) = ctx.input(|i| (is_video && i.key_pressed(Key::Space), is_video && i.key_pressed(Key::M)));
+        if let Some((_, Ok(player))) = &mut self.video {
+            if play_pause {
+                player.toggle();
+            }
+            if mute {
+                self.settings.video_muted = !player.muted();
+                player.set_muted(self.settings.video_muted);
+            }
+        }
         let (next, prev, first, last, esc, fs_toggle, fit, one, zoom_in, zoom_out) = ctx.input(|i| {
             (
-                i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::ArrowDown) || i.key_pressed(Key::Space) || i.key_pressed(Key::PageDown),
+                i.key_pressed(Key::ArrowRight)
+                    || i.key_pressed(Key::ArrowDown)
+                    || (!is_video && i.key_pressed(Key::Space))
+                    || i.key_pressed(Key::PageDown),
                 i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::Backspace) || i.key_pressed(Key::PageUp),
                 i.key_pressed(Key::Home),
                 i.key_pressed(Key::End),
@@ -1099,18 +1130,55 @@ impl CyclopsApp {
         let Some(index) = self.viewer.as_ref().map(|v| v.index) else { return };
         let entry = self.entries[index].clone();
 
+        // Videos: (re)open the player for this file and pull the next frame.
+        let mut video_frame = None;
+        let mut video_size = None;
+        if entry.is_video {
+            if self.video.as_ref().is_none_or(|(p, _)| *p != entry.path) {
+                self.video = None; // stop the previous one first
+                let player = VideoPlayer::open(&entry.path, &ctx, self.settings.video_muted).map_err(|e| e.to_string());
+                self.video = Some((entry.path.clone(), player));
+            }
+            if let Some((_, Ok(player))) = &mut self.video {
+                player.update(&ctx);
+                if player.is_playing() {
+                    ctx.request_repaint();
+                }
+                video_frame = player.texture().map(|t| t.id());
+                video_size = player.size().map(|[w, h]| vec2(w as f32, h as f32));
+            }
+        } else {
+            self.video = None;
+        }
+
         // Pick what to draw: the full image, or the thumbnail as an instant placeholder.
         let full = self.full.get(&entry.path);
-        let (source_size, status) = match full {
-            Some(Full::Ready(img)) => (Some(img.source_size), format!("{:.0} ms", img.decode_ms)),
-            Some(Full::Failed(e)) => (None, format!("error: {e}")),
-            _ => (None, "loading…".to_owned()),
+        let (source_size, status) = if entry.is_video {
+            let status = match &self.video {
+                Some((_, Err(e))) => format!("error: {e}"),
+                Some((_, Ok(p))) if p.failed() => "can't play this video".to_owned(),
+                Some((_, Ok(p))) => video::format_time(p.duration()),
+                None => String::new(),
+            };
+            (video_size, status)
+        } else {
+            match full {
+                Some(Full::Ready(img)) => (Some(img.source_size), format!("{:.0} ms", img.decode_ms)),
+                Some(Full::Failed(e)) => (None, format!("error: {e}")),
+                _ => (None, "loading…".to_owned()),
+            }
         };
         let thumb = match self.thumbs.get(&entry.path) {
             Some(Thumb::Ready { tex, .. }) => Some(tex.clone()),
             _ => None,
         };
-        let natural = source_size.or_else(|| thumb.as_ref().map(|t| t.size_vec2()));
+        let still = match full {
+            Some(Full::Ready(img)) if entry.is_video => Some(img.main.clone()),
+            _ => None,
+        };
+        let natural = source_size
+            .or_else(|| still.as_ref().map(|t| t.size_vec2()))
+            .or_else(|| thumb.as_ref().map(|t| t.size_vec2()));
 
         // Wheel input, split by Ctrl: Ctrl+wheel always zooms; the plain wheel follows the setting.
         let (wheel_plain, wheel_ctrl, pinch) = if resp.hovered() {
@@ -1137,7 +1205,9 @@ impl CyclopsApp {
         let mut zoom_pct = None;
         if let (Some(natural), Some(v)) = (natural, self.viewer.as_mut()) {
             // Fit, but never upscale small images beyond 100% (1 source px = 1 screen px).
-            let fit = (rect.width() / natural.x).min(rect.height() / natural.y).min(1.0 / ppp);
+            // Photos never upscale past 100%; videos fill the view like any player.
+            let fill = (rect.width() / natural.x).min(rect.height() / natural.y);
+            let fit = if entry.is_video { fill } else { fill.min(1.0 / ppp) };
             let fit = if source_size.is_some() { fit } else { (rect.width() / natural.x).min(rect.height() / natural.y) };
             let scale = v.zoom.unwrap_or(fit);
 
@@ -1222,6 +1292,10 @@ impl CyclopsApp {
 
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
             let tex_id = match self.full.get(&entry.path) {
+                _ if entry.is_video => video_frame
+                    .or_else(|| still.as_ref().map(|t| t.id()))
+                    .or_else(|| thumb.as_ref().map(|t| t.id()))
+                    .unwrap_or_default(),
                 Some(Full::Ready(img)) => {
                     let physical = size * ppp;
                     match &img.screen {
@@ -1253,8 +1327,11 @@ impl CyclopsApp {
             }
         }
 
-        if let Some(Full::Failed(e)) = self.full.get(&entry.path) {
+        if let (false, Some(Full::Failed(e))) = (entry.is_video, self.full.get(&entry.path)) {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, format!("Could not open image\n{e}"), FontId::proportional(16.0), theme::p().text_dim);
+        }
+        if entry.is_video {
+            self.video_controls(ui, rect);
         }
 
         if !self.settings.show_info_bar {
@@ -1386,6 +1463,71 @@ impl CyclopsApp {
     }
 }
 
+impl CyclopsApp {
+    /// Floating glass transport bar: play/pause, time, seek bar, mute.
+    fn video_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        let lift = if self.settings.show_info_bar { 86.0 } else { 40.0 };
+        let Some((_, Ok(player))) = &mut self.video else { return };
+        let painter = ui.painter().clone();
+        let bar = Rect::from_center_size(pos2(rect.center().x, rect.max.y - lift), vec2((rect.width() - 48.0).min(760.0), 44.0));
+        painter.rect(bar, CornerRadius::same(14), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
+        let fg = theme::DARK.text;
+        let cy = bar.center().y;
+
+        let button = |ui: &mut egui::Ui, center: egui::Pos2, salt: &str, icon: Icon| {
+            let r = Rect::from_center_size(center, vec2(32.0, 32.0));
+            let resp = ui.interact(r, ui.scope_id().with(salt), Sense::click());
+            if resp.hovered() {
+                painter.rect_filled(r, CornerRadius::same(8), Color32::from_white_alpha(20));
+            }
+            icons::paint(&painter, r.shrink(8.0), icon, if resp.hovered() { Color32::WHITE } else { fg });
+            resp
+        };
+
+        let playing = player.is_playing();
+        if button(ui, pos2(bar.min.x + 26.0, cy), "video-play", if playing { Icon::Pause } else { Icon::Play }).clicked() {
+            player.toggle();
+        }
+        let muted = player.muted();
+        if button(ui, pos2(bar.max.x - 26.0, cy), "video-mute", if muted { Icon::Mute } else { Icon::Volume }).clicked() {
+            player.set_muted(!muted);
+            self.settings.video_muted = !muted;
+        }
+
+        let (pos, dur) = (player.position(), player.duration());
+        let time = painter.layout_no_wrap(
+            format!("{} / {}", video::format_time(pos), video::format_time(dur)),
+            FontId::monospace(12.0),
+            fg,
+        );
+        let time_x = bar.min.x + 50.0;
+        painter.galley(pos2(time_x, cy - time.size().y / 2.0), time.clone(), fg);
+
+        let track = Rect::from_min_max(pos2(time_x + time.size().x + 14.0, cy - 2.5), pos2(bar.max.x - 52.0, cy + 2.5));
+        if track.width() > 20.0 {
+            let seek = ui.interact(track.expand2(vec2(6.0, 12.0)), ui.scope_id().with("video-seek"), Sense::click_and_drag());
+            if (seek.dragged() || seek.clicked()) && dur > 0.0 {
+                if let Some(p) = seek.interact_pointer_pos() {
+                    let frac = ((p.x - track.min.x) / track.width()).clamp(0.0, 1.0) as f64;
+                    player.seek(frac * dur);
+                }
+            }
+            let frac = if dur > 0.0 { (player.position() / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
+            let knob_x = track.min.x + track.width() * frac;
+            painter.rect_filled(track, CornerRadius::same(3), Color32::from_white_alpha(40));
+            painter.rect_filled(Rect::from_min_max(track.min, pos2(knob_x, track.max.y)), CornerRadius::same(3), theme::DARK.accent);
+            let knob_r = if seek.hovered() || seek.dragged() { 7.0 } else { 5.5 };
+            painter.circle_filled(pos2(knob_x, cy), knob_r, Color32::WHITE);
+        }
+    }
+}
+
+/// A small round "play" marker drawn over video thumbnails.
+fn video_badge(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
+    painter.circle(center, radius, Color32::from_black_alpha(160), Stroke::new(1.0, Color32::from_white_alpha(60)));
+    icons::paint(painter, Rect::from_center_size(center, Vec2::splat(radius * 1.1)), Icon::Play, Color32::WHITE);
+}
+
 /// Whether `folder` lives in the tree branch below `root`.
 fn under_root(folder: &Path, root: &Path) -> bool {
     if fs::location(root) == fs::Location::Network {
@@ -1412,6 +1554,9 @@ impl eframe::App for CyclopsApp {
             self.grid_keyboard(&ctx);
         }
         self.update_full_cache();
+        if self.viewer.is_none() {
+            self.video = None;
+        }
 
         if self.viewer.is_some() {
             egui::CentralPanel::no_frame()
@@ -1464,6 +1609,7 @@ impl eframe::App for CyclopsApp {
         storage.set_string("wheel_zooms", self.settings.wheel_zooms.to_string());
         storage.set_string("show_dates", self.settings.show_dates.to_string());
         storage.set_string("show_info_bar", self.settings.show_info_bar.to_string());
+        storage.set_string("video_muted", self.settings.video_muted.to_string());
         storage.set_string("three_pane", self.settings.three_pane.to_string());
         storage.set_string("preview_width", self.settings.preview_width.to_string());
         let places: Vec<String> = self.network_places.iter().map(|p| p.display().to_string()).collect();

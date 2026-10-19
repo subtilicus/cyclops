@@ -4,13 +4,14 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::decode::is_image;
+use crate::decode::{is_media, is_video};
 
 #[derive(Clone)]
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+    pub is_video: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
     /// Pre-formatted local modification time, so tiles don't format every frame.
@@ -149,7 +150,7 @@ pub fn subdirs_any(p: &Path) -> Vec<PathBuf> {
 }
 
 pub fn dir_entry(path: PathBuf) -> Entry {
-    Entry { name: display_name(&path), path, is_dir: true, size: 0, modified: None, modified_label: String::new() }
+    Entry { name: display_name(&path), path, is_dir: true, is_video: false, size: 0, modified: None, modified_label: String::new() }
 }
 
 fn is_hidden(path: &Path, name: &str) -> bool {
@@ -191,12 +192,13 @@ pub fn list(dir: &Path) -> std::io::Result<Vec<Entry>> {
             let name = e.file_name().to_string_lossy().into_owned();
             let meta = e.metadata().ok()?;
             let is_dir = meta.is_dir();
-            if is_hidden(&path, &name) || !(is_dir || is_image(&path)) {
+            if is_hidden(&path, &name) || !(is_dir || is_media(&path)) {
                 return None;
             }
             let modified = meta.modified().ok();
             let modified_label = modified.map(format_time).unwrap_or_default();
-            Some(Entry { path, name, is_dir, size: meta.len(), modified, modified_label })
+            let is_video = !is_dir && is_video(&path);
+            Some(Entry { path, name, is_dir, is_video, size: meta.len(), modified, modified_label })
         })
         .collect();
     sort(&mut entries, SortKey::Name, false);
