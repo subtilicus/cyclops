@@ -1992,14 +1992,16 @@ impl CyclopsApp {
         let cy = pill.center().y;
         painter.text(pos2(pill.min.x + 14.0, cy), Align2::LEFT_CENTER, "Exposure", FontId::proportional(12.5), fg);
 
-        let track = Rect::from_min_max(pos2(pill.min.x + 88.0, cy - 2.5), pos2(pill.max.x - 112.0, cy + 2.5));
+        let track = Rect::from_min_max(pos2(pill.min.x + 88.0, cy - 2.5), pos2(pill.max.x - 124.0, cy + 2.5));
         let resp = ui.interact(track.expand2(vec2(8.0, 12.0)), ui.scope_id().with(("exposure", path)), Sense::click_and_drag());
         if resp.double_clicked() {
             hdr.ev = 0.0;
         } else if resp.dragged() || resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
                 let t = ((p.x - track.min.x) / track.width()).clamp(0.0, 1.0);
-                hdr.ev = ((t * 2.0 - 1.0) * RANGE * 10.0).round() / 10.0;
+                // Continuous (no step snapping) so dragging is smooth; a small detent at 0 EV.
+                let ev = (t * 2.0 - 1.0) * RANGE;
+                hdr.ev = if ev.abs() < 0.06 { 0.0 } else { ev };
             }
         }
         if resp.hovered() {
@@ -2018,7 +2020,7 @@ impl CyclopsApp {
         );
         painter.vline(centre_x, (cy - 6.0)..=(cy + 6.0), Stroke::new(1.0, Color32::from_white_alpha(90)));
         painter.circle_filled(pos2(knob_x, cy), if resp.hovered() || resp.dragged() { 7.0 } else { 5.5 }, Color32::WHITE);
-        painter.text(pos2(track.max.x + 12.0, cy), Align2::LEFT_CENTER, format!("{:+.1} EV", hdr.ev), FontId::monospace(12.0), fg);
+        painter.text(pos2(track.max.x + 12.0, cy), Align2::LEFT_CENTER, format!("{:+.2} EV", hdr.ev), FontId::monospace(12.0), fg);
 
         let auto = Rect::from_center_size(pos2(pill.max.x - 28.0, cy), vec2(44.0, 24.0));
         let auto_resp = ui.interact(auto, ui.scope_id().with(("exposure-auto", path)), Sense::click());
