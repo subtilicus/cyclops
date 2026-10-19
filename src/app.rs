@@ -133,14 +133,134 @@ impl ZoomAnim {
     }
 }
 
-struct Viewer {
-    /// Index into `entries` (always an image).
-    index: usize,
-    /// Points per source pixel; `None` means fit to window.
+/// Zoom and pan of an image inside a view (the fullscreen viewer and the preview pane).
+#[derive(Default)]
+struct ZoomPan {
+    /// Points per source pixel; `None` means fit to the view.
     zoom: Option<f32>,
     pan: Vec2,
     /// Running zoom animation, if any.
     anim: Option<ZoomAnim>,
+}
+
+impl ZoomPan {
+    /// Apply this frame's input and return where to draw the image and at what scale.
+    ///
+    /// `factor` is the wheel/pinch/keyboard zoom (anchored at `focus`); double-click toggles
+    /// between fit and 100%, dragging pans. `can_zoom` is false while only a placeholder is shown.
+    #[allow(clippy::too_many_arguments)]
+    fn update(
+        &mut self,
+        ctx: &egui::Context,
+        rect: Rect,
+        resp: &egui::Response,
+        natural: Vec2,
+        fit: f32,
+        factor: f32,
+        focus: egui::Pos2,
+        can_zoom: bool,
+    ) -> (Rect, f32) {
+        let ppp = ctx.pixels_per_point();
+        let scale = self.zoom.unwrap_or(fit);
+        let (min_scale, max_scale) = (fit * 0.5, 32.0 / ppp);
+        let now = ctx.input(|i| i.time);
+        let start_zoom = |zp: &mut ZoomPan, to: f32, focus: egui::Pos2, to_fit: bool| {
+            let chained = zp.anim.is_some();
+            zp.anim = Some(ZoomAnim {
+                from_scale: scale,
+                to_scale: to,
+                from_pan: zp.pan,
+                focus,
+                start: now,
+                duration: if chained { 0.22 } else { 0.32 },
+                chained,
+                to_fit,
+            });
+        };
+        if (factor - 1.0).abs() > 1e-4 && can_zoom {
+            let base = self.anim.map_or(scale, |a| a.to_scale);
+            start_zoom(self, (base * factor).clamp(min_scale, max_scale), focus, false);
+        }
+        if resp.double_clicked() && can_zoom {
+            let focus = resp.interact_pointer_pos().unwrap_or(rect.center());
+            if self.zoom.is_some() && (scale - fit).abs() > 1e-4 {
+                start_zoom(self, fit, focus, true);
+            } else {
+                start_zoom(self, (1.0 / ppp).max(fit * 2.0).min(max_scale), focus, false);
+            }
+        }
+        if resp.drag_started() {
+            self.anim = None;
+        }
+
+        if let Some(a) = self.anim {
+            let (e, done) = a.eased(now);
+            // Interpolate in log space so zooming in and out feel equally fast.
+            let new_scale = a.from_scale * (a.to_scale / a.from_scale).powf(e);
+            let from_center = rect.center() + a.from_pan;
+            let new_center = a.focus - (a.focus - from_center) * (new_scale / a.from_scale);
+            self.pan = new_center - rect.center();
+            if a.to_fit {
+                self.pan *= 1.0 - e;
+            }
+            self.zoom = Some(new_scale);
+            if done {
+                self.anim = None;
+                if a.to_fit {
+                    self.zoom = None;
+                    self.pan = Vec2::ZERO;
+                }
+            } else {
+                ctx.request_repaint();
+            }
+        }
+
+        if resp.dragged() {
+            self.pan += resp.drag_delta();
+        }
+
+        let scale = self.zoom.unwrap_or(fit);
+        let size = natural * scale;
+        // Allow panning until an image edge reaches the view centre, so any part of the
+        // image (corners included) can be centred, but it can never be lost entirely.
+        let max_pan = size / 2.0;
+        self.pan = self.pan.clamp(-max_pan, max_pan);
+        if resp.hovered() {
+            ctx.set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        }
+        (Rect::from_center_size(rect.center() + self.pan, size), scale)
+    }
+}
+
+/// This frame's wheel travel over a hovered view, split into (plain, with Ctrl), plus pinch zoom.
+fn wheel_input(ctx: &egui::Context, hovered: bool) -> (f32, f32, f32) {
+    if !hovered {
+        return (0.0, 0.0, 1.0);
+    }
+    ctx.input(|i| {
+        i.events.iter().fold((0.0f32, 0.0f32, 1.0f32), |(w, c, z), e| match e {
+            egui::Event::MouseWheel { unit, delta, modifiers, .. } => {
+                let d = match unit {
+                    egui::MouseWheelUnit::Line => delta.y * 50.0,
+                    egui::MouseWheelUnit::Page => delta.y * 500.0,
+                    egui::MouseWheelUnit::Point => delta.y,
+                };
+                if modifiers.ctrl { (w, c + d, z) } else { (w + d, c, z) }
+            }
+            egui::Event::Zoom(f) => (w, c, z * f),
+            _ => (w, c, z),
+        })
+    })
+}
+
+fn wheel_zoom_factor(wheel: f32) -> f32 {
+    (wheel * 0.0035).exp()
+}
+
+struct Viewer {
+    /// Index into `entries` (always an image).
+    index: usize,
+    view: ZoomPan,
     /// Wheel travel accumulated towards the next image (when the wheel navigates).
     wheel_accum: f32,
 }
@@ -188,6 +308,9 @@ pub struct CyclopsApp {
     full_lru: VecDeque<PathBuf>,
     fullscreen: bool,
     pending_key_zoom: f32,
+    /// Zoom/pan of the preview pane, and the file it applies to (reset on selection change).
+    preview_view: ZoomPan,
+    preview_for: Option<PathBuf>,
     /// The video playing in the viewer (path it was opened for, player or error).
     video: Option<(PathBuf, Result<VideoPlayer, String>)>,
     /// Last time the pointer moved or clicked in the viewer (drives control auto-hide).
@@ -261,6 +384,8 @@ impl CyclopsApp {
             fullscreen: false,
             pending_key_zoom: 1.0,
             video: None,
+            preview_view: ZoomPan::default(),
+            preview_for: None,
             last_pointer_activity: 0.0,
             frame_no: 0,
             max_texture_side: 8192,
@@ -463,13 +588,7 @@ impl CyclopsApp {
     }
 
     fn open_viewer(&mut self, index: usize) {
-        self.viewer = Some(Viewer {
-            index,
-            zoom: None,
-            pan: Vec2::ZERO,
-            anim: None,
-            wheel_accum: 0.0,
-        });
+        self.viewer = Some(Viewer { index, view: ZoomPan::default(), wheel_accum: 0.0 });
         self.selected = Some(index);
     }
 
@@ -1144,13 +1263,11 @@ impl CyclopsApp {
         }
         if let Some(v) = &mut self.viewer {
             if fit {
-                v.zoom = None;
-                v.anim = None;
-                v.pan = Vec2::ZERO;
+                v.view = ZoomPan::default();
             }
             if one {
-                v.zoom = Some(1.0 / ctx.pixels_per_point());
-                v.anim = None;
+                v.view.zoom = Some(1.0 / ctx.pixels_per_point());
+                v.view.anim = None;
             }
         }
         self.pending_key_zoom = if zoom_in { 1.25 } else if zoom_out { 0.8 } else { 1.0 };
@@ -1214,114 +1331,20 @@ impl CyclopsApp {
             .or_else(|| still.as_ref().map(|t| t.size_vec2()))
             .or_else(|| thumb.as_ref().map(|t| t.size_vec2()));
 
-        // Wheel input, split by Ctrl: Ctrl+wheel always zooms; the plain wheel follows the setting.
-        let (wheel_plain, wheel_ctrl, pinch) = if resp.hovered() {
-            ctx.input(|i| {
-                i.events.iter().fold((0.0f32, 0.0f32, 1.0f32), |(w, c, z), e| match e {
-                    egui::Event::MouseWheel { unit, delta, modifiers, .. } => {
-                        let d = match unit {
-                            egui::MouseWheelUnit::Line => delta.y * 50.0,
-                            egui::MouseWheelUnit::Page => delta.y * 500.0,
-                            egui::MouseWheelUnit::Point => delta.y,
-                        };
-                        if modifiers.ctrl { (w, c + d, z) } else { (w + d, c, z) }
-                    }
-                    egui::Event::Zoom(f) => (w, c, z * f),
-                    _ => (w, c, z),
-                })
-            })
-        } else {
-            (0.0, 0.0, 1.0)
-        };
+        // Ctrl+wheel always zooms; the plain wheel follows the setting.
+        let (wheel_plain, wheel_ctrl, pinch) = wheel_input(&ctx, resp.hovered());
         let (wheel, wheel_nav) =
             if self.settings.wheel_zooms { (wheel_plain + wheel_ctrl, 0.0) } else { (wheel_ctrl, wheel_plain) };
 
         let mut zoom_pct = None;
         if let (Some(natural), Some(v)) = (natural, self.viewer.as_mut()) {
-            // Fit, but never upscale small images beyond 100% (1 source px = 1 screen px).
-            // Photos never upscale past 100%; videos fill the view like any player.
+            // Photos never upscale past 100% (1 source px = 1 screen px); videos fill the view.
             let fill = (rect.width() / natural.x).min(rect.height() / natural.y);
-            let fit = if entry.is_video { fill } else { fill.min(1.0 / ppp) };
-            let fit = if source_size.is_some() { fit } else { (rect.width() / natural.x).min(rect.height() / natural.y) };
-            let scale = v.zoom.unwrap_or(fit);
-
-            let min_scale = fit * 0.5;
-            let max_scale = 32.0 / ppp;
-
-            // Wheel, pinch, keys and double-click start a zoom animation anchored at a focus point.
-            let now = ctx.input(|i| i.time);
-            let start_zoom = |v: &mut Viewer, to: f32, focus: egui::Pos2, to_fit: bool| {
-                let chained = v.anim.is_some();
-                v.anim = Some(ZoomAnim {
-                    from_scale: scale,
-                    to_scale: to,
-                    from_pan: v.pan,
-                    focus,
-                    start: now,
-                    duration: if chained { 0.22 } else { 0.32 },
-                    chained,
-                    to_fit,
-                });
-            };
-            let factor = (wheel * 0.0035).exp() * pinch * self.pending_key_zoom;
-            if (factor - 1.0).abs() > 1e-4 && source_size.is_some() {
-                let base = v.anim.map_or(scale, |a| a.to_scale);
-                let focus = if wheel != 0.0 || pinch != 1.0 {
-                    resp.hover_pos().unwrap_or(rect.center())
-                } else {
-                    rect.center()
-                };
-                start_zoom(v, (base * factor).clamp(min_scale, max_scale), focus, false);
-            }
-            if resp.double_clicked() {
-                let focus = resp.interact_pointer_pos().unwrap_or(rect.center());
-                if v.zoom.is_some() && (scale - fit).abs() > 1e-4 {
-                    start_zoom(v, fit, focus, true);
-                } else {
-                    start_zoom(v, (1.0 / ppp).max(fit * 2.0).min(max_scale), focus, false);
-                }
-            }
-            if resp.drag_started() {
-                v.anim = None;
-            }
-
-            if let Some(a) = v.anim {
-                let (e, done) = a.eased(now);
-                // Interpolate in log space so zooming in and out feel equally fast.
-                let new_scale = a.from_scale * (a.to_scale / a.from_scale).powf(e);
-                let from_center = rect.center() + a.from_pan;
-                let new_center = a.focus - (a.focus - from_center) * (new_scale / a.from_scale);
-                v.pan = new_center - rect.center();
-                if a.to_fit {
-                    v.pan *= 1.0 - e;
-                }
-                v.zoom = Some(new_scale);
-                if done {
-                    v.anim = None;
-                    if a.to_fit {
-                        v.zoom = None;
-                        v.pan = Vec2::ZERO;
-                    }
-                } else {
-                    ctx.request_repaint();
-                }
-            }
-
-            // Left-drag pans.
-            if resp.dragged() {
-                v.pan += resp.drag_delta();
-            }
-
-            let scale = v.zoom.unwrap_or(fit);
-            let size = natural * scale;
-            // Allow panning until an image edge reaches the view centre, so any part of the
-            // image (corners included) can be centred, but it can never be lost entirely.
-            let max_pan = size / 2.0;
-            v.pan = v.pan.clamp(-max_pan, max_pan);
-            let draw = Rect::from_center_size(rect.center() + v.pan, size);
-            if resp.hovered() {
-                ctx.set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
-            }
+            let fit = if entry.is_video || source_size.is_none() { fill } else { fill.min(1.0 / ppp) };
+            let factor = wheel_zoom_factor(wheel) * pinch * self.pending_key_zoom;
+            let focus = if wheel != 0.0 || pinch != 1.0 { resp.hover_pos().unwrap_or(rect.center()) } else { rect.center() };
+            let (draw, scale) = v.view.update(&ctx, rect, &resp, natural, fit, factor, focus, source_size.is_some());
+            let size = draw.size();
             zoom_pct = Some(scale * ppp * 100.0);
 
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -1425,9 +1448,10 @@ impl CyclopsApp {
         let entry = self.entries[index].clone();
         let info_h = 64.0;
         let img_rect = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y - info_h));
-        let resp = ui.interact(img_rect, ui.scope_id().with("preview"), Sense::click());
-        if resp.double_clicked() {
-            self.activate(index);
+        let resp = ui.interact(img_rect, ui.scope_id().with("preview"), Sense::click_and_drag());
+        if self.preview_for.as_ref() != Some(&entry.path) {
+            self.preview_for = Some(entry.path.clone());
+            self.preview_view = ZoomPan::default();
         }
 
         let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
@@ -1455,11 +1479,14 @@ impl CyclopsApp {
             };
             let natural = full.as_ref().map(|f| f.0).or_else(|| thumb.as_ref().map(|t| t.size_vec2()));
             if let Some(natural) = natural {
-                let mut scale = (img_rect.width() / natural.x).min(img_rect.height() / natural.y);
-                if full.is_some() {
-                    scale = scale.min(1.0 / ppp);
-                }
-                let draw = Rect::from_center_size(img_rect.center(), natural * scale);
+                let fill = (img_rect.width() / natural.x).min(img_rect.height() / natural.y);
+                let fit = if full.is_some() { fill.min(1.0 / ppp) } else { fill };
+                // In the pane the wheel always zooms (there's nothing to scroll).
+                let (plain, ctrl, pinch) = wheel_input(ui.ctx(), resp.hovered());
+                let factor = wheel_zoom_factor(plain + ctrl) * pinch;
+                let focus = resp.hover_pos().unwrap_or(img_rect.center());
+                let (draw, _) =
+                    self.preview_view.update(ui.ctx(), img_rect, &resp, natural, fit, factor, focus, full.is_some());
                 let tex = match &full {
                     Some((.., Some(frame))) => *frame,
                     Some((_, main, screen, None)) => match screen {

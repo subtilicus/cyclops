@@ -83,6 +83,7 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
     match ext.as_str() {
         "svg" | "svgz" => return decode_svg(&bytes, vector_side),
         "psd" => return decode_psd(&bytes),
+        "hdr" | "exr" => return decode_hdr(&bytes),
         _ => {}
     }
     if is_jpeg(path) {
@@ -187,6 +188,44 @@ fn decode_svg(bytes: &[u8], side: u32) -> Result<Decoded, String> {
         })
         .collect();
     let image = RgbaImage::from_raw(w, h, rgba).ok_or("SVG buffer size mismatch")?;
+    let opaque = is_opaque(&image);
+    Ok(Decoded::still(image, opaque))
+}
+
+/// Radiance HDR and OpenEXR hold linear scene light. Map it to display: auto-exposure from the
+/// log-average luminance, the ACES filmic curve (Narkowicz fit) for highlights, then sRGB encoding.
+fn decode_hdr(bytes: &[u8]) -> Result<Decoded, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?.into_rgba32f();
+    let (w, h) = img.dimensions();
+    let px = img.as_raw();
+
+    let luminance = |p: &[f32]| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+    let (mut log_sum, mut count) = (0.0f64, 0usize);
+    for p in px.chunks_exact(4).step_by(7) {
+        let l = luminance(p);
+        if l.is_finite() && l > 0.0 {
+            log_sum += (l as f64 + 1e-4).ln();
+            count += 1;
+        }
+    }
+    let average = if count > 0 { (log_sum / count as f64).exp() as f32 } else { 0.18 };
+    // Map the scene's average to middle grey, within sane limits.
+    let exposure = (0.18 / average.max(1e-6)).clamp(1.0 / 64.0, 64.0);
+
+    let aces = |x: f32| {
+        let x = (x * exposure).max(0.0);
+        ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
+    };
+    let to_srgb = |c: f32| {
+        let v = if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+        (v * 255.0 + 0.5) as u8
+    };
+    let mut out = Vec::with_capacity(px.len());
+    for p in px.chunks_exact(4) {
+        let a = if p[3].is_finite() { p[3].clamp(0.0, 1.0) } else { 1.0 };
+        out.extend([to_srgb(aces(p[0])), to_srgb(aces(p[1])), to_srgb(aces(p[2])), (a * 255.0 + 0.5) as u8]);
+    }
+    let image = RgbaImage::from_raw(w, h, out).ok_or("HDR buffer size mismatch")?;
     let opaque = is_opaque(&image);
     Ok(Decoded::still(image, opaque))
 }
