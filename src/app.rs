@@ -79,6 +79,30 @@ struct FullImage {
     screen: Option<TextureHandle>,
     source_size: Vec2,
     decode_ms: f32,
+    /// Animation frames with durations in seconds (empty for stills).
+    frames: Vec<(TextureHandle, f32)>,
+    /// When the image became ready; animations play from here.
+    ready_at: f64,
+}
+
+impl FullImage {
+    /// The animation frame to show at `now` (scheduling a repaint for the next one),
+    /// or `None` for still images.
+    fn frame_at(&self, now: f64, ctx: &egui::Context) -> Option<egui::TextureId> {
+        let total: f32 = self.frames.iter().map(|(_, d)| d).sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let mut t = ((now - self.ready_at) as f32).rem_euclid(total);
+        for (tex, duration) in &self.frames {
+            if t < *duration {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f32(duration - t));
+                return Some(tex.id());
+            }
+            t -= duration;
+        }
+        self.frames.first().map(|(tex, _)| tex.id())
+    }
 }
 
 /// A timed zoom from one scale to another, keeping `focus` fixed on screen.
@@ -513,6 +537,15 @@ impl CyclopsApp {
                     if let Some(slot) = self.full.get_mut(&loaded.path) {
                         *slot = match loaded.result {
                             Ok(images) => Full::Ready(FullImage {
+                                frames: images
+                                    .frames
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, (img, secs))| {
+                                        (ctx.load_texture(format!("{name}#{i}"), img, TextureOptions::LINEAR), secs)
+                                    })
+                                    .collect(),
+                                ready_at: ctx.input(|i| i.time),
                                 main: ctx.load_texture(name.clone(), images.main, TextureOptions::LINEAR),
                                 screen: images
                                     .screen
@@ -1300,6 +1333,7 @@ impl CyclopsApp {
                 Some(Full::Ready(img)) => {
                     let physical = size * ppp;
                     match &img.screen {
+                        _ if !img.frames.is_empty() => img.frame_at(ctx.input(|i| i.time), &ctx).unwrap_or(img.main.id()),
                         Some(s) if physical.x <= s.size_vec2().x * 1.05 => s.id(),
                         _ => img.main.id(),
                     }
@@ -1410,8 +1444,9 @@ impl CyclopsApp {
             details.push("Folder".to_owned());
         } else {
             // Full image when decoded, the thumbnail (scaled to the final size) until then.
+            let now = ui.ctx().input(|i| i.time);
             let full = match self.full.get(&entry.path) {
-                Some(Full::Ready(img)) => Some((img.source_size, img.main.clone(), img.screen.clone())),
+                Some(Full::Ready(img)) => Some((img.source_size, img.main.clone(), img.screen.clone(), img.frame_at(now, ui.ctx()))),
                 _ => None,
             };
             let thumb = match self.thumbs.get(&entry.path) {
@@ -1426,7 +1461,8 @@ impl CyclopsApp {
                 }
                 let draw = Rect::from_center_size(img_rect.center(), natural * scale);
                 let tex = match &full {
-                    Some((_, main, screen)) => match screen {
+                    Some((.., Some(frame))) => *frame,
+                    Some((_, main, screen, None)) => match screen {
                         Some(s) if draw.width() * ppp <= s.size_vec2().x * 1.05 => s.id(),
                         _ => main.id(),
                     },

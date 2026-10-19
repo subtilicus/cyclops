@@ -42,6 +42,8 @@ pub struct Images {
     pub screen: Option<ColorImage>,
     /// Native pixel size of the source image (after EXIF orientation).
     pub source_size: [usize; 2],
+    /// Animation frames and their durations in seconds (empty for stills).
+    pub frames: Vec<(ColorImage, f32)>,
     pub decode_ms: f32,
 }
 
@@ -123,6 +125,7 @@ fn worker(
                     source_size: main.size,
                     main,
                     screen: None,
+                    frames: Vec::new(),
                     decode_ms: start.elapsed().as_secs_f32() * 1000.0,
                 })
                 .ok_or_else(|| "no thumbnail".to_owned());
@@ -132,10 +135,28 @@ fn worker(
             ctx.request_repaint();
             continue;
         }
-        let result = decode::decode(&job.path).map(|d| {
-            let source_size = [d.image.width() as usize, d.image.height() as usize];
+        // RAW/HEIC thumbnails: Explorer's cached thumbnail is far faster than a full decode.
+        if job.kind == Kind::Thumb && crate::wic::handles(&job.path) {
+            if let Some(main) = crate::shell::thumbnail_only(&job.path, job.max_side) {
+                let images = Images { source_size: main.size, main, screen: None, frames: Vec::new(), decode_ms: 0.0 };
+                if done_tx.send(Loaded { path: job.path, kind: job.kind, result: Ok(images) }).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+                continue;
+            }
+        }
+        let full = job.kind == Kind::Full;
+        let vector_side = if full { job.screen_side.max(1024) } else { job.max_side };
+        let result = decode::decode(&job.path, job.max_side, vector_side, full).map(|d| {
+            let source_size = [d.source_size[0] as usize, d.source_size[1] as usize];
+            let frames: Vec<(ColorImage, f32)> = d
+                .frames
+                .into_iter()
+                .map(|(img, secs)| (to_color_image(decode::fit_within(img, job.max_side), false), secs))
+                .collect();
             let main_img = decode::fit_within(d.image, job.max_side);
-            let screen = (job.kind == Kind::Full)
+            let screen = (job.kind == Kind::Full && frames.is_empty())
                 .then(|| {
                     let longest = main_img.width().max(main_img.height());
                     // Only worth it when the image is substantially larger than the screen.
@@ -144,7 +165,7 @@ fn worker(
                 })
                 .flatten();
             let main = to_color_image(main_img, d.opaque);
-            Images { main, screen, source_size, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
+            Images { main, screen, source_size, frames, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
         });
         if done_tx.send(Loaded { path: job.path, kind: job.kind, result }).is_err() {
             return;

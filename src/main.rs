@@ -8,6 +8,7 @@ mod loader;
 mod shell;
 mod theme;
 mod video;
+mod wic;
 
 use std::path::PathBuf;
 

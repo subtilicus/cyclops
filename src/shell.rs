@@ -27,6 +27,12 @@ pub fn thumbnail(path: &std::path::Path, px: u32) -> Option<ColorImage> {
     imp::item_image(&path.to_string_lossy(), px, false)
 }
 
+/// Explorer's cached thumbnail only (no icon fallback). Blocks; call from a worker thread.
+pub fn thumbnail_only(path: &std::path::Path, px: u32) -> Option<ColorImage> {
+    imp::init_com_mta();
+    imp::item_thumbnail(&path.to_string_lossy(), px)
+}
+
 pub struct IconLoader {
     tx: Sender<(PathBuf, u32)>,
     rx: Receiver<(PathBuf, u32, Option<ColorImage>)>,
@@ -159,12 +165,20 @@ mod imp {
         item_image(path, px, true)
     }
 
+    pub fn item_thumbnail(path: &str, px: u32) -> Option<ColorImage> {
+        image_with_flags(path, px, SIIGBF_THUMBNAILONLY)
+    }
+
     pub fn item_image(path: &str, px: u32, icon_only: bool) -> Option<ColorImage> {
+        let flags = if icon_only { SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK } else { SIIGBF_BIGGERSIZEOK };
+        image_with_flags(path, px, flags)
+    }
+
+    fn image_with_flags(path: &str, px: u32, flags: SIIGBF) -> Option<ColorImage> {
         unsafe {
             let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(path), None).ok()?;
             let factory: IShellItemImageFactory = windows::core::Interface::cast(&item).ok()?;
             let size = SIZE { cx: px as i32, cy: px as i32 };
-            let flags = if icon_only { SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK } else { SIIGBF_BIGGERSIZEOK };
             let hbmp = factory.GetImage(size, flags).ok()?;
             let obj = HGDIOBJ(hbmp.0);
             let mut bm = BITMAP::default();
@@ -230,6 +244,10 @@ mod imp {
     }
 
     pub fn item_image(_path: &str, _px: u32, _icon_only: bool) -> Option<ColorImage> {
+        None
+    }
+
+    pub fn item_thumbnail(_path: &str, _px: u32) -> Option<ColorImage> {
         None
     }
 }

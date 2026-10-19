@@ -1,6 +1,10 @@
-//! Image decoding: fast path for JPEG via zune-jpeg, everything else via `image`.
+//! Image decoding: zune-jpeg for JPEG, Windows Imaging Component for HEIC/AVIF/JXL/RAW,
+//! resvg for SVG, the `psd` crate for Photoshop composites, and `image` for everything else
+//! (including animated GIF/WebP/APNG).
 
+use std::io::Cursor;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use image::RgbaImage;
 use zune_core::bytestream::ZCursor;
@@ -9,7 +13,8 @@ use zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
 
 pub const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "jpe", "jfif", "png", "gif", "bmp", "webp", "tif", "tiff",
+    "jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "bmp", "webp", "tif", "tiff", "ico", "tga", "dds", "hdr",
+    "exr", "qoi", "pbm", "pgm", "ppm", "pnm", "pam", "svg", "svgz", "psd",
 ];
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
@@ -28,9 +33,15 @@ pub fn is_media(path: &Path) -> bool {
 }
 
 pub fn is_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+    crate::wic::handles(path)
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+fn extension(path: &Path) -> String {
+    path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
 }
 
 fn is_jpeg(path: &Path) -> bool {
@@ -40,22 +51,152 @@ fn is_jpeg(path: &Path) -> bool {
 }
 
 pub struct Decoded {
+    /// The (first) image; may already be scaled down for WIC and SVG sources.
     pub image: RgbaImage,
     /// Whether every pixel is opaque (lets us skip premultiplication).
     pub opaque: bool,
+    /// Full pixel size of the source, after orientation.
+    pub source_size: [u32; 2],
+    /// Animation frames with their display time in seconds (empty for stills).
+    pub frames: Vec<(RgbaImage, f32)>,
 }
 
-pub fn decode(path: &Path) -> Result<Decoded, String> {
+impl Decoded {
+    fn still(image: RgbaImage, opaque: bool) -> Self {
+        let source_size = [image.width(), image.height()];
+        Self { image, opaque, source_size, frames: Vec::new() }
+    }
+}
+
+/// Decode `path`. Raster formats that can scale while decoding (WIC) stop at `max_side`;
+/// vector formats render with their longest side at `vector_side`. With `animate`, animated
+/// GIF/WebP/APNG return all frames.
+pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Result<Decoded, String> {
+    let ext = extension(path);
+    if crate::wic::handles(path) {
+        let wic = crate::wic::decode(path, max_side).map_err(|e| codec_hint(&ext, e))?;
+        let image = apply_orientation(wic.image, wic.orientation);
+        let opaque = is_opaque(&image);
+        return Ok(Decoded { image, opaque, source_size: wic.source_size, frames: Vec::new() });
+    }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    match ext.as_str() {
+        "svg" | "svgz" => return decode_svg(&bytes, vector_side),
+        "psd" => return decode_psd(&bytes),
+        _ => {}
+    }
     if is_jpeg(path) {
         // Some files have a .jpg extension but are something else; fall back to `image`.
         if let Ok(d) = decode_jpeg(&bytes) {
             return Ok(d);
         }
     }
+    if animate {
+        if let Some(frames) = decode_animation(&bytes, &ext) {
+            let image = frames[0].0.clone();
+            let source_size = [image.width(), image.height()];
+            return Ok(Decoded { image, opaque: false, source_size, frames });
+        }
+    }
     let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
     let opaque = !img.color().has_alpha();
-    Ok(Decoded { image: img.to_rgba8(), opaque })
+    Ok(Decoded::still(img.to_rgba8(), opaque))
+}
+
+/// Point at the free Store codec when Windows can't decode a format.
+fn codec_hint(ext: &str, err: String) -> String {
+    let hint = match ext {
+        "heic" | "heif" | "hif" => "install HEIF Image Extensions (and HEVC Video Extensions) from the Microsoft Store",
+        "avif" => "install AV1 Video Extension from the Microsoft Store",
+        "jxl" => "install JPEG XL Image Extension from the Microsoft Store",
+        "jxr" | "wdp" | "hdp" => return err,
+        _ => "install Raw Image Extension from the Microsoft Store",
+    };
+    format!("{err}\n{hint}")
+}
+
+fn is_opaque(image: &RgbaImage) -> bool {
+    image.as_raw().chunks_exact(4).all(|p| p[3] == 255)
+}
+
+/// All frames of an animated GIF, WebP or APNG, or `None` for stills (or absurdly large animations).
+fn decode_animation(bytes: &[u8], ext: &str) -> Option<Vec<(RgbaImage, f32)>> {
+    use image::AnimationDecoder;
+    use image::codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder};
+    const BUDGET: usize = 768 << 20;
+
+    let frames = match ext {
+        "gif" => GifDecoder::new(Cursor::new(bytes)).ok()?.into_frames(),
+        "webp" => {
+            let d = WebPDecoder::new(Cursor::new(bytes)).ok()?;
+            if !d.has_animation() {
+                return None;
+            }
+            d.into_frames()
+        }
+        "png" | "apng" => {
+            let d = PngDecoder::new(Cursor::new(bytes)).ok()?;
+            if !d.is_apng().ok()? {
+                return None;
+            }
+            d.apng().ok()?.into_frames()
+        }
+        _ => return None,
+    };
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for frame in frames {
+        let frame = frame.ok()?;
+        let (num, den) = frame.delay().numer_denom_ms();
+        let ms = num as f32 / den.max(1) as f32;
+        // Browsers treat near-zero delays as 100 ms; so do we.
+        let secs = if ms <= 10.0 { 0.1 } else { ms / 1000.0 };
+        let image = frame.into_buffer();
+        used += image.as_raw().len();
+        if used > BUDGET {
+            return None;
+        }
+        out.push((image, secs));
+    }
+    (out.len() > 1).then_some(out)
+}
+
+fn decode_svg(bytes: &[u8], side: u32) -> Result<Decoded, String> {
+    use resvg::{tiny_skia, usvg};
+    static FONTS: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
+    let mut options = usvg::Options::default();
+    options.fontdb = FONTS
+        .get_or_init(|| {
+            let mut db = usvg::fontdb::Database::new();
+            db.load_system_fonts();
+            Arc::new(db)
+        })
+        .clone();
+    let tree = usvg::Tree::from_data(bytes, &options).map_err(|e| e.to_string())?;
+    let size = tree.size();
+    let scale = side.max(16) as f32 / size.width().max(size.height());
+    let (w, h) = (((size.width() * scale).ceil() as u32).max(1), ((size.height() * scale).ceil() as u32).max(1));
+    let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or("SVG is too large to render")?;
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    let rgba: Vec<u8> = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|p| {
+            let c = p.demultiply();
+            [c.red(), c.green(), c.blue(), c.alpha()]
+        })
+        .collect();
+    let image = RgbaImage::from_raw(w, h, rgba).ok_or("SVG buffer size mismatch")?;
+    let opaque = is_opaque(&image);
+    Ok(Decoded::still(image, opaque))
+}
+
+/// Photoshop files carry a flattened composite of all layers; show that.
+fn decode_psd(bytes: &[u8]) -> Result<Decoded, String> {
+    let psd = psd::Psd::from_bytes(bytes).map_err(|e| e.to_string())?;
+    let image = RgbaImage::from_raw(psd.width(), psd.height(), psd.rgba()).ok_or("PSD buffer size mismatch")?;
+    let opaque = is_opaque(&image);
+    Ok(Decoded::still(image, opaque))
 }
 
 fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
@@ -70,7 +211,7 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     let orientation = decoder.exif().and_then(|e| exif_orientation(e)).unwrap_or(1);
     let image = RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
         .ok_or("jpeg buffer size mismatch")?;
-    Ok(Decoded { image: apply_orientation(image, orientation), opaque: true })
+    Ok(Decoded::still(apply_orientation(image, orientation), true))
 }
 
 /// Downscale (area-averaging) so that neither side exceeds `max_side`.
