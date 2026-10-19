@@ -78,17 +78,42 @@ struct FullImage {
     decode_ms: f32,
 }
 
+/// A timed zoom from one scale to another, keeping `focus` fixed on screen.
+#[derive(Clone, Copy)]
+struct ZoomAnim {
+    from_scale: f32,
+    to_scale: f32,
+    from_pan: Vec2,
+    focus: egui::Pos2,
+    start: f64,
+    duration: f32,
+    /// Retargeted mid-flight (e.g. continued wheel scrolling): ease out only, so the
+    /// motion keeps its momentum instead of stalling at the start of a new S-curve.
+    chained: bool,
+    /// Ends in "fit" mode, gliding the image back to the centre on the way.
+    to_fit: bool,
+}
+
+impl ZoomAnim {
+    fn eased(&self, now: f64) -> (f32, bool) {
+        let u = (((now - self.start) as f32) / self.duration).clamp(0.0, 1.0);
+        let e = if self.chained {
+            1.0 - (1.0 - u).powi(3) // ease-out cubic
+        } else {
+            u * u * u * (u * (u * 6.0 - 15.0) + 10.0) // smootherstep: gentle S-curve
+        };
+        (e, u >= 1.0)
+    }
+}
+
 struct Viewer {
     /// Index into `entries` (always an image).
     index: usize,
     /// Points per source pixel; `None` means fit to window.
     zoom: Option<f32>,
     pan: Vec2,
-    /// Smooth zoom: the scale being animated towards, anchored at `focus`.
-    target: Option<f32>,
-    focus: egui::Pos2,
-    /// Switch back to tracking "fit" once the animation reaches it.
-    fit_when_done: bool,
+    /// Running zoom animation, if any.
+    anim: Option<ZoomAnim>,
     /// Wheel travel accumulated towards the next image (when the wheel navigates).
     wheel_accum: f32,
 }
@@ -407,9 +432,7 @@ impl CyclopsApp {
             index,
             zoom: None,
             pan: Vec2::ZERO,
-            target: None,
-            focus: egui::Pos2::ZERO,
-            fit_when_done: false,
+            anim: None,
             wheel_accum: 0.0,
         });
         self.selected = Some(index);
@@ -1057,12 +1080,12 @@ impl CyclopsApp {
         if let Some(v) = &mut self.viewer {
             if fit {
                 v.zoom = None;
-                v.target = None;
+                v.anim = None;
                 v.pan = Vec2::ZERO;
             }
             if one {
                 v.zoom = Some(1.0 / ctx.pixels_per_point());
-                v.target = None;
+                v.anim = None;
             }
         }
         self.pending_key_zoom = if zoom_in { 1.25 } else if zoom_out { 0.8 } else { 1.0 };
@@ -1121,52 +1144,62 @@ impl CyclopsApp {
             let min_scale = fit * 0.5;
             let max_scale = 32.0 / ppp;
 
-            // Wheel and pinch set a zoom target anchored at the cursor; the scale glides towards it.
+            // Wheel, pinch, keys and double-click start a zoom animation anchored at a focus point.
+            let now = ctx.input(|i| i.time);
+            let start_zoom = |v: &mut Viewer, to: f32, focus: egui::Pos2, to_fit: bool| {
+                let chained = v.anim.is_some();
+                v.anim = Some(ZoomAnim {
+                    from_scale: scale,
+                    to_scale: to,
+                    from_pan: v.pan,
+                    focus,
+                    start: now,
+                    duration: if chained { 0.22 } else { 0.32 },
+                    chained,
+                    to_fit,
+                });
+            };
             let factor = (wheel * 0.0035).exp() * pinch * self.pending_key_zoom;
             if (factor - 1.0).abs() > 1e-4 && source_size.is_some() {
-                let base = v.target.unwrap_or(scale);
-                v.target = Some((base * factor).clamp(min_scale, max_scale));
-                v.focus = if wheel != 0.0 || pinch != 1.0 {
+                let base = v.anim.map_or(scale, |a| a.to_scale);
+                let focus = if wheel != 0.0 || pinch != 1.0 {
                     resp.hover_pos().unwrap_or(rect.center())
                 } else {
                     rect.center()
                 };
-                v.fit_when_done = false;
+                start_zoom(v, (base * factor).clamp(min_scale, max_scale), focus, false);
             }
             if resp.double_clicked() {
-                v.focus = resp.interact_pointer_pos().unwrap_or(rect.center());
+                let focus = resp.interact_pointer_pos().unwrap_or(rect.center());
                 if v.zoom.is_some() && (scale - fit).abs() > 1e-4 {
-                    v.target = Some(fit);
-                    v.fit_when_done = true;
+                    start_zoom(v, fit, focus, true);
                 } else {
-                    v.target = Some((1.0 / ppp).max(fit * 2.0).min(max_scale));
-                    v.fit_when_done = false;
+                    start_zoom(v, (1.0 / ppp).max(fit * 2.0).min(max_scale), focus, false);
                 }
             }
+            if resp.drag_started() {
+                v.anim = None;
+            }
 
-            if let Some(target) = v.target {
-                let dt = ctx.input(|i| i.stable_dt).min(0.05);
-                // Exponential ease in log space: equal-feeling speed at every zoom level.
-                let t = 1.0 - (-dt * 18.0).exp();
-                let mut new_scale = scale * (target / scale).powf(t);
-                if (new_scale / target - 1.0).abs() < 0.002 {
-                    new_scale = target;
-                    v.target = None;
-                } else {
-                    ctx.request_repaint();
-                }
-                let center = rect.center() + v.pan;
-                let new_center = v.focus - (v.focus - center) * (new_scale / scale);
+            if let Some(a) = v.anim {
+                let (e, done) = a.eased(now);
+                // Interpolate in log space so zooming in and out feel equally fast.
+                let new_scale = a.from_scale * (a.to_scale / a.from_scale).powf(e);
+                let from_center = rect.center() + a.from_pan;
+                let new_center = a.focus - (a.focus - from_center) * (new_scale / a.from_scale);
                 v.pan = new_center - rect.center();
+                if a.to_fit {
+                    v.pan *= 1.0 - e;
+                }
                 v.zoom = Some(new_scale);
-                if v.fit_when_done {
-                    // Returning to fit also glides the image back to the centre.
-                    v.pan *= 1.0 - t;
-                    if v.target.is_none() {
+                if done {
+                    v.anim = None;
+                    if a.to_fit {
                         v.zoom = None;
                         v.pan = Vec2::ZERO;
-                        v.fit_when_done = false;
                     }
+                } else {
+                    ctx.request_repaint();
                 }
             }
 
