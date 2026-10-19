@@ -103,7 +103,7 @@ mod imp {
     }
 
     impl VideoPlayer {
-        pub fn open(path: &Path, ctx: &egui::Context, muted: bool) -> windows::core::Result<Self> {
+        pub fn open(path: &Path, ctx: &egui::Context, muted: bool, volume: f32) -> windows::core::Result<Self> {
             startup();
             let (device, context) = create_device()?;
             unsafe {
@@ -129,6 +129,7 @@ mod imp {
                     CoCreateInstance(&CLSID_MFMediaEngineClassFactory, None, CLSCTX_INPROC_SERVER)?;
                 let engine = factory.CreateInstance(0, &attributes)?;
                 engine.SetMuted(muted)?;
+                engine.SetVolume(volume.clamp(0.0, 1.0) as f64)?;
                 engine.SetAutoPlay(true)?;
                 engine.SetSource(&BSTR::from(path.to_string_lossy().as_ref()))?;
 
@@ -189,6 +190,15 @@ mod imp {
 
         pub fn set_muted(&mut self, muted: bool) {
             let _ = unsafe { self.engine.SetMuted(muted) };
+        }
+
+        /// 0.0–1.0 (the engine's scale is linear amplitude).
+        pub fn volume(&self) -> f32 {
+            unsafe { self.engine.GetVolume() as f32 }
+        }
+
+        pub fn set_volume(&mut self, volume: f32) {
+            let _ = unsafe { self.engine.SetVolume(volume.clamp(0.0, 1.0) as f64) };
         }
 
         /// Pull the latest decoded frame (if a new one is due) into the egui texture.
@@ -280,7 +290,7 @@ mod imp {
     pub struct VideoPlayer;
 
     impl VideoPlayer {
-        pub fn open(_path: &Path, _ctx: &egui::Context, _muted: bool) -> Result<Self, String> {
+        pub fn open(_path: &Path, _ctx: &egui::Context, _muted: bool, _volume: f32) -> Result<Self, String> {
             Err("video playback is not supported on this platform yet".into())
         }
         pub fn failed(&self) -> bool {
@@ -307,6 +317,10 @@ mod imp {
             false
         }
         pub fn set_muted(&mut self, _muted: bool) {}
+        pub fn volume(&self) -> f32 {
+            0.0
+        }
+        pub fn set_volume(&mut self, _volume: f32) {}
         pub fn update(&mut self, _ctx: &egui::Context) {}
     }
 }

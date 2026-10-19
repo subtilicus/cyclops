@@ -50,8 +50,9 @@ multi-threaded decoding (zune-jpeg fast path), neighbour prefetch and a zoom/pan
 | Viewer  | → ↓ Space PgDn / ← ↑ Backspace PgUp   | Next / previous image     |
 | Viewer  | Mouse wheel · pinch · + / -           | Smooth zoom around cursor |
 | Viewer  | Left-drag · double-click              | Pan · toggle fit / 100%   |
-| Viewer  | 0 · 1 · F / F11 · Esc                 | Fit · 100% · Fullscreen · Back |
-| Video   | Space · M                             | Play/pause · Mute         |
+| Viewer  | 0 · 1 · Esc                           | Fit · 100% · Back         |
+| Anywhere| F · F11 · Alt+Enter                   | Toggle fullscreen         |
+| Video   | Space · M · wheel over volume         | Play/pause · Mute · Volume |
 
 Pass a folder or image path on the command line to open it directly. Network: browse via the
 Network node, or type `\\server` or `\\server\share` in the path bar; visited servers are remembered.

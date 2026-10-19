@@ -55,6 +55,7 @@ struct Settings {
     show_dates: bool,
     show_info_bar: bool,
     video_muted: bool,
+    video_volume: f32,
     /// Folders | thumbnails | preview, instead of folders | thumbnails.
     three_pane: bool,
     /// Width of the preview pane in points.
@@ -165,6 +166,8 @@ pub struct CyclopsApp {
     pending_key_zoom: f32,
     /// The video playing in the viewer (path it was opened for, player or error).
     video: Option<(PathBuf, Result<VideoPlayer, String>)>,
+    /// Last time the pointer moved or clicked in the viewer (drives control auto-hide).
+    last_pointer_activity: f64,
 
     frame_no: u64,
     max_texture_side: u32,
@@ -181,6 +184,7 @@ impl CyclopsApp {
             show_dates: flag("show_dates", true),
             show_info_bar: flag("show_info_bar", true),
             video_muted: flag("video_muted", false),
+            video_volume: stored("video_volume").and_then(|s| s.parse().ok()).unwrap_or(1.0),
             three_pane: flag("three_pane", false),
             preview_width: stored("preview_width").and_then(|s| s.parse().ok()).unwrap_or(460.0),
         };
@@ -233,6 +237,7 @@ impl CyclopsApp {
             fullscreen: false,
             pending_key_zoom: 1.0,
             video: None,
+            last_pointer_activity: 0.0,
             frame_no: 0,
             max_texture_side: 8192,
             screen_side: 2560,
@@ -842,7 +847,7 @@ impl CyclopsApp {
         }
         let (enter, back, alt_left, refresh) = ctx.input(|i| {
             (
-                i.key_pressed(Key::Enter),
+                !i.modifiers.alt && i.key_pressed(Key::Enter),
                 i.key_pressed(Key::Backspace),
                 i.modifiers.alt && i.key_pressed(Key::ArrowLeft),
                 i.key_pressed(Key::F5),
@@ -1066,7 +1071,7 @@ impl CyclopsApp {
                 player.set_muted(self.settings.video_muted);
             }
         }
-        let (next, prev, first, last, esc, fs_toggle, fit, one, zoom_in, zoom_out) = ctx.input(|i| {
+        let (next, prev, first, last, esc, fit, one, zoom_in, zoom_out) = ctx.input(|i| {
             (
                 i.key_pressed(Key::ArrowRight)
                     || i.key_pressed(Key::ArrowDown)
@@ -1075,8 +1080,7 @@ impl CyclopsApp {
                 i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::Backspace) || i.key_pressed(Key::PageUp),
                 i.key_pressed(Key::Home),
                 i.key_pressed(Key::End),
-                i.key_pressed(Key::Escape) || i.key_pressed(Key::Enter),
-                i.key_pressed(Key::F11) || i.key_pressed(Key::F),
+                i.key_pressed(Key::Escape) || (!i.modifiers.alt && i.key_pressed(Key::Enter)),
                 i.key_pressed(Key::Num0) || i.key_pressed(Key::Slash),
                 i.key_pressed(Key::Num1),
                 i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals),
@@ -1104,9 +1108,6 @@ impl CyclopsApp {
                 self.close_viewer(ctx);
             }
             return;
-        }
-        if fs_toggle {
-            self.set_fullscreen(ctx, !self.fullscreen);
         }
         if let Some(v) = &mut self.viewer {
             if fit {
@@ -1136,7 +1137,7 @@ impl CyclopsApp {
         if entry.is_video {
             if self.video.as_ref().is_none_or(|(p, _)| *p != entry.path) {
                 self.video = None; // stop the previous one first
-                let player = VideoPlayer::open(&entry.path, &ctx, self.settings.video_muted).map_err(|e| e.to_string());
+                let player = VideoPlayer::open(&entry.path, &ctx, self.settings.video_muted, self.settings.video_volume).map_err(|e| e.to_string());
                 self.video = Some((entry.path.clone(), player));
             }
             if let Some((_, Ok(player))) = &mut self.video {
@@ -1330,11 +1331,10 @@ impl CyclopsApp {
         if let (false, Some(Full::Failed(e))) = (entry.is_video, self.full.get(&entry.path)) {
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, format!("Could not open image\n{e}"), FontId::proportional(16.0), theme::p().text_dim);
         }
-        if entry.is_video {
-            self.video_controls(ui, rect);
-        }
+        // Overlay opacity: videos fade their controls (and the info pill) out when the mouse rests.
+        let overlay_alpha = if entry.is_video { self.video_controls(ui, rect) } else { 1.0 };
 
-        if !self.settings.show_info_bar {
+        if !self.settings.show_info_bar || overlay_alpha <= 0.0 {
             return;
         }
         // Floating glass info pill (always dark, it sits on top of the photo).
@@ -1349,7 +1349,8 @@ impl CyclopsApp {
             info += &format!("    {z:.0}%");
         }
         info += &format!("    {status}");
-        let painter = ui.painter();
+        let mut painter = ui.painter().clone();
+        painter.multiply_opacity(overlay_alpha);
         let galley = painter.layout_no_wrap(info, FontId::proportional(13.0), theme::DARK.text);
         let pill = Rect::from_center_size(
             pos2(rect.center().x, rect.max.y - 30.0),
@@ -1464,12 +1465,40 @@ impl CyclopsApp {
 }
 
 impl CyclopsApp {
-    /// Floating glass transport bar: play/pause, time, seek bar, mute.
-    fn video_controls(&mut self, ui: &mut egui::Ui, rect: Rect) {
+    /// Floating glass transport bar: play/pause, time, seek, volume, mute.
+    /// Fades out (with the cursor) once the mouse rests while playing; returns its opacity.
+    fn video_controls(&mut self, ui: &mut egui::Ui, rect: Rect) -> f32 {
+        const SHOW_FOR: f64 = 1.6;
+        const FADE: f64 = 0.45;
         let lift = if self.settings.show_info_bar { 86.0 } else { 40.0 };
-        let Some((_, Ok(player))) = &mut self.video else { return };
-        let painter = ui.painter().clone();
         let bar = Rect::from_center_size(pos2(rect.center().x, rect.max.y - lift), vec2((rect.width() - 48.0).min(760.0), 44.0));
+        let ctx = ui.ctx().clone();
+        let (now, active, pointer) = ctx.input(|i| {
+            (i.time, i.pointer.is_moving() || i.pointer.any_down() || i.pointer.any_pressed(), i.pointer.hover_pos())
+        });
+        if active {
+            self.last_pointer_activity = now;
+        }
+        let Some((_, Ok(player))) = &mut self.video else { return 1.0 };
+        let over_bar = pointer.is_some_and(|p| bar.expand(12.0).contains(p));
+        let idle = now - self.last_pointer_activity;
+        let alpha = if over_bar || !player.is_playing() {
+            1.0
+        } else {
+            (1.0 - ((idle - SHOW_FOR) / FADE).clamp(0.0, 1.0)) as f32
+        };
+        if alpha <= 0.0 {
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+            return 0.0;
+        }
+        if alpha < 1.0 {
+            ctx.request_repaint();
+        } else if !over_bar && player.is_playing() {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64((SHOW_FOR - idle).max(0.0)));
+        }
+
+        let mut painter = ui.painter().clone();
+        painter.multiply_opacity(alpha);
         painter.rect(bar, CornerRadius::same(14), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
         let fg = theme::DARK.text;
         let cy = bar.center().y;
@@ -1503,7 +1532,49 @@ impl CyclopsApp {
         let time_x = bar.min.x + 50.0;
         painter.galley(pos2(time_x, cy - time.size().y / 2.0), time.clone(), fg);
 
-        let track = Rect::from_min_max(pos2(time_x + time.size().x + 14.0, cy - 2.5), pos2(bar.max.x - 52.0, cy + 2.5));
+        // Volume: a short slider left of the mute button; the wheel over it nudges the level.
+        let vol_track = Rect::from_min_max(pos2(bar.max.x - 52.0 - 84.0, cy - 2.5), pos2(bar.max.x - 50.0, cy + 2.5));
+        let vol = ui.interact(vol_track.expand2(vec2(6.0, 12.0)), ui.scope_id().with("video-volume"), Sense::click_and_drag());
+        let mut volume = player.volume();
+        let mut volume_changed = false;
+        if vol.dragged() || vol.clicked() {
+            if let Some(p) = vol.interact_pointer_pos() {
+                volume = ((p.x - vol_track.min.x) / vol_track.width()).clamp(0.0, 1.0);
+                volume_changed = true;
+            }
+        }
+        if vol.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                volume = (volume + scroll / 600.0).clamp(0.0, 1.0);
+                volume_changed = true;
+            }
+        }
+        if volume_changed {
+            player.set_volume(volume);
+            self.settings.video_volume = volume;
+            // Raising the volume while muted unmutes, like most players.
+            if player.muted() && volume > 0.0 {
+                player.set_muted(false);
+                self.settings.video_muted = false;
+            }
+        }
+        let shown = if player.muted() { 0.0 } else { volume };
+        let vol_x = vol_track.min.x + vol_track.width() * shown;
+        painter.rect_filled(vol_track, CornerRadius::same(3), Color32::from_white_alpha(40));
+        painter.rect_filled(Rect::from_min_max(vol_track.min, pos2(vol_x, vol_track.max.y)), CornerRadius::same(3), fg);
+        painter.circle_filled(pos2(vol_x, cy), if vol.hovered() || vol.dragged() { 6.5 } else { 5.0 }, Color32::WHITE);
+        if vol.hovered() || vol.dragged() {
+            painter.text(
+                pos2(vol_x, bar.min.y - 8.0),
+                Align2::CENTER_BOTTOM,
+                format!("{:.0}%", shown * 100.0),
+                FontId::proportional(12.0),
+                Color32::WHITE,
+            );
+        }
+
+        let track = Rect::from_min_max(pos2(time_x + time.size().x + 14.0, cy - 2.5), pos2(vol_track.min.x - 22.0, cy + 2.5));
         if track.width() > 20.0 {
             let seek = ui.interact(track.expand2(vec2(6.0, 12.0)), ui.scope_id().with("video-seek"), Sense::click_and_drag());
             if (seek.dragged() || seek.clicked()) && dur > 0.0 {
@@ -1519,6 +1590,7 @@ impl CyclopsApp {
             let knob_r = if seek.hovered() || seek.dragged() { 7.0 } else { 5.5 };
             painter.circle_filled(pos2(knob_x, cy), knob_r, Color32::WHITE);
         }
+        alpha
     }
 }
 
@@ -1548,6 +1620,16 @@ impl eframe::App for CyclopsApp {
         }
         self.receive(&ctx);
 
+        // F, F11 and Alt+Enter toggle fullscreen everywhere (unless typing in a text field).
+        let fullscreen_key = !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| {
+                i.key_pressed(Key::F11) || (i.key_pressed(Key::F) && i.modifiers.is_none()) || (i.modifiers.alt && i.key_pressed(Key::Enter))
+            });
+        if fullscreen_key {
+            self.set_fullscreen(&ctx, !self.fullscreen);
+        } else if self.fullscreen && self.viewer.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.set_fullscreen(&ctx, false);
+        }
         if self.viewer.is_some() {
             self.viewer_input(&ctx);
         } else {
@@ -1610,6 +1692,7 @@ impl eframe::App for CyclopsApp {
         storage.set_string("show_dates", self.settings.show_dates.to_string());
         storage.set_string("show_info_bar", self.settings.show_info_bar.to_string());
         storage.set_string("video_muted", self.settings.video_muted.to_string());
+        storage.set_string("video_volume", self.settings.video_volume.to_string());
         storage.set_string("three_pane", self.settings.three_pane.to_string());
         storage.set_string("preview_width", self.settings.preview_width.to_string());
         let places: Vec<String> = self.network_places.iter().map(|p| p.display().to_string()).collect();
