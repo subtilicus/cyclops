@@ -75,9 +75,17 @@ mod imp {
             let extend = if material.translucent() { -1 } else { 0 };
             let margins = MARGINS { cxLeftWidth: extend, cxRightWidth: extend, cyTopHeight: extend, cyBottomHeight: extend };
             let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-            // A custom caption colour would paint over the material; let Windows draw it then.
-            let caption = if material.translucent() { COLORREF(DWMWA_COLOR_DEFAULT) } else { colorref(caption) };
-            set(hwnd, DWMWA_CAPTION_COLOR, &caption);
+            // The GDI surface under our GPU layer must be black: inside the extended frame, black
+            // means "show the system backdrop". (Otherwise it is erased white and hides Mica.)
+            if material.translucent() {
+                use windows::Win32::Graphics::Gdi::{BLACK_BRUSH, GetStockObject, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow};
+                use windows::Win32::UI::WindowsAndMessaging::{GCLP_HBRBACKGROUND, SetClassLongPtrW};
+                SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, GetStockObject(BLACK_BRUSH).0 as isize);
+                let _ = RedrawWindow(Some(hwnd), None, None, RDW_ERASE | RDW_INVALIDATE | RDW_FRAME);
+            }
+            // Always our own caption colour: "default" would pick up the user's accent colour
+            // when Windows is set to show it on title bars.
+            set(hwnd, DWMWA_CAPTION_COLOR, &colorref(caption));
             set(hwnd, DWMWA_TEXT_COLOR, &colorref(text));
             set(hwnd, DWMWA_BORDER_COLOR, &colorref(border));
         }

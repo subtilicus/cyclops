@@ -100,10 +100,14 @@ mod imp {
         let result = unsafe { ShellExecuteW(None, w!("edit"), &HSTRING::from(file.as_os_str()), None, None, SW_SHOWNORMAL) };
         // Per the API, values above 32 mean success.
         if result.0 as isize > 32 {
-            Ok(())
-        } else {
-            Err("Windows has no default editor for this file type; choose one in Settings".into())
+            return Ok(());
         }
+        // Many types (PNG, GIF, WebP…) have no "Edit" action registered; Paint opens them all.
+        std::process::Command::new("mspaint.exe")
+            .arg(file)
+            .spawn()
+            .map(|_| ())
+            .map_err(|_| "Windows has no editor for this file type; choose one in Settings".into())
     }
 
     pub fn pick_program() -> Option<PathBuf> {
