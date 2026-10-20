@@ -411,6 +411,8 @@ pub struct CyclopsApp {
     detected_editors: Vec<PathBuf>,
     /// Window focus last frame; regaining focus re-syncs the folder (e.g. after editing).
     was_focused: bool,
+    /// Skin the native title bar was last styled for.
+    chrome_dark: Option<bool>,
     dialog: Option<Dialog>,
     /// A short message (e.g. a failed delete) and when it was posted.
     toast: Option<(String, f64)>,
@@ -500,6 +502,7 @@ impl CyclopsApp {
             settings_page: None,
             detected_editors: crate::editor::detect(),
             was_focused: true,
+            chrome_dark: None,
             dialog: None,
             toast: None,
             preview_view: ZoomPan::default(),
@@ -2545,9 +2548,16 @@ fn under_root(folder: &Path, root: &Path) -> bool {
 }
 
 impl eframe::App for CyclopsApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         theme::sync(&ctx);
+        // Native title bar follows the skin (caption matching the toolbar, rounded corners).
+        let dark = ctx.theme() == egui::Theme::Dark;
+        if self.chrome_dark != Some(dark) {
+            let p = theme::p();
+            crate::chrome::style(frame, dark, p.panel, p.text, p.border);
+            self.chrome_dark = Some(dark);
+        }
         crate::perflog::ENABLED.store(self.settings.perf_log, std::sync::atomic::Ordering::Relaxed);
         // Coming back to the window (e.g. from the photo editor): pick up changed files.
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));

@@ -512,6 +512,7 @@ dependencies = [
  "half",
  "image",
  "psd",
+ "raw-window-handle",
  "rayon",
  "resvg",
  "windows",
