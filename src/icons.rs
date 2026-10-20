@@ -17,6 +17,7 @@ pub enum Icon {
     Grid,
     Warning,
     Cog,
+    Close,
     TwoPane,
     ThreePane,
     Sort,
@@ -82,6 +83,10 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 let r = Rect::from_min_size(p(x, y), vec2(5.0, 5.0) * s);
                 painter.rect_stroke(r, CornerRadius::same((1.5 * s) as u8), stroke, egui::StrokeKind::Middle);
             }
+        }
+        Icon::Close => {
+            line(&[p(4.0, 4.0), p(12.0, 12.0)]);
+            line(&[p(12.0, 4.0), p(4.0, 12.0)]);
         }
         Icon::Cog => {
             let c = p(8.0, 8.0);

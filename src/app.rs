@@ -49,6 +49,29 @@ impl Skin {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsPage {
+    Appearance,
+    Browsing,
+    Viewer,
+    Editor,
+    Developer,
+}
+
+impl SettingsPage {
+    const ALL: [Self; 5] = [Self::Appearance, Self::Browsing, Self::Viewer, Self::Editor, Self::Developer];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::Browsing => "Browsing",
+            Self::Viewer => "Viewer",
+            Self::Editor => "Editor",
+            Self::Developer => "Developer",
+        }
+    }
+}
+
 struct Settings {
     skin: Skin,
     /// Viewer mouse wheel zooms (true) or flips between images (false).
@@ -382,6 +405,8 @@ pub struct CyclopsApp {
     fullscreen: bool,
     pending_key_zoom: f32,
     pending_action: Option<FileAction>,
+    /// The settings window, if open, and the page it shows.
+    settings_page: Option<SettingsPage>,
     /// Photo editors found on this PC (for the settings menu).
     detected_editors: Vec<PathBuf>,
     /// Window focus last frame; regaining focus re-syncs the folder (e.g. after editing).
@@ -472,6 +497,7 @@ impl CyclopsApp {
             pending_key_zoom: 1.0,
             video: None,
             pending_action: None,
+            settings_page: None,
             detected_editors: crate::editor::detect(),
             was_focused: true,
             dialog: None,
@@ -643,6 +669,11 @@ impl CyclopsApp {
         if !wanted {
             return None;
         }
+        self.file_icon(path, px)
+    }
+
+    /// Windows' icon for any file or program (fetched in the background, cached).
+    fn file_icon(&mut self, path: &Path, px: u32) -> Option<egui::TextureId> {
         let key = (path.to_path_buf(), px);
         match self.shell_icons.get(&key) {
             Some(tex) => tex.as_ref().map(|t| t.id()),
@@ -914,87 +945,191 @@ impl CyclopsApp {
                 self.settings.three_pane = true;
             }
             ui.add_space(4.0);
-            let cog = icons::button(ui, Icon::Cog, true, "Settings");
-            egui::Popup::menu(&cog)
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .align(egui::RectAlign::BOTTOM_END)
-                .gap(6.0)
-                .show(|ui| self.settings_menu(ui));
+            if icons::button(ui, Icon::Cog, true, "Settings").clicked() {
+                self.settings_page = Some(self.settings_page.unwrap_or(SettingsPage::Appearance));
+            }
         });
     }
 
-    fn settings_menu(&mut self, ui: &mut egui::Ui) {
-        ui.set_width(260.0);
-        let heading = |ui: &mut egui::Ui, text: &str| {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(text).small().strong().color(theme::p().text_dim));
-        };
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let Some(mut page) = self.settings_page else { return };
+        let p = theme::p();
+        let frame = egui::Frame::NONE
+            .fill(p.panel)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(CornerRadius::same(14))
+            .shadow(egui::Shadow { offset: [0, 12], blur: 40, spread: 0, color: Color32::from_black_alpha(110) });
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::NULL.with("cyclops-settings")).frame(frame).show(ctx, |ui| {
+            let height = 520.0_f32.min(ctx.content_rect().height() - 80.0);
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                // Sidebar
+                egui::Frame::NONE
+                    .fill(p.bg)
+                    .corner_radius(CornerRadius { nw: 14, sw: 14, ne: 0, se: 0 })
+                    .inner_margin(egui::Margin::symmetric(12, 18))
+                    .show(ui, |ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(176.0);
+                            ui.set_height(height - 36.0);
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            ui.label(egui::RichText::new("Settings").size(18.0).color(p.text_strong));
+                            ui.add_space(14.0);
+                            for candidate in SettingsPage::ALL {
+                                let selected = page == candidate;
+                                let text = egui::RichText::new(candidate.label())
+                                    .size(14.0)
+                                    .color(if selected { p.text_strong } else { p.text });
+                                let button = egui::Button::selectable(selected, text).min_size(vec2(176.0, 32.0));
+                                if ui.add(button).clicked() {
+                                    page = candidate;
+                                }
+                            }
+                            ui.add_space((ui.available_height() - 18.0).max(0.0));
+                            ui.label(egui::RichText::new(concat!("Cyclops ", env!("CARGO_PKG_VERSION"))).small().color(p.text_dim));
+                        });
+                    });
+                // Content
+                egui::Frame::NONE.inner_margin(egui::Margin { left: 28, right: 20, top: 16, bottom: 20 }).show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(560.0);
+                        ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(page.label()).size(20.0).color(p.text_strong));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if icons::button(ui, Icon::Close, true, "Close (Esc)").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                        ui.add_space(14.0);
+                        egui::ScrollArea::vertical().max_height(height - 90.0).auto_shrink([false, true]).show(ui, |ui| {
+                            ui.vertical(|ui| match page {
+                                SettingsPage::Appearance => self.settings_appearance(ui),
+                                SettingsPage::Browsing => self.settings_browsing(ui),
+                                SettingsPage::Viewer => self.settings_viewer(ui),
+                                SettingsPage::Editor => self.settings_editor(ui),
+                                SettingsPage::Developer => self.settings_developer(ui),
+                            });
+                        });
+                    });
+                });
+            });
+        });
+        self.settings_page = if close || modal.should_close() { None } else { Some(page) };
+    }
 
-        heading(ui, "SKIN");
-        ui.horizontal(|ui| {
-            let before = self.settings.skin;
-            for skin in Skin::ALL {
-                ui.selectable_value(&mut self.settings.skin, skin, skin.label());
-            }
-            if before != self.settings.skin {
+    fn settings_appearance(&mut self, ui: &mut egui::Ui) {
+        setting_row(ui, "Skin", "System follows the Windows light/dark setting.", |ui| {
+            let options = Skin::ALL.map(|s| (s, s.label()));
+            if segmented(ui, &mut self.settings.skin, &options) {
                 ui.ctx().set_theme(self.settings.skin.preference());
             }
         });
+    }
 
-        ui.separator();
-        heading(ui, "THUMBNAILS");
-        ui.horizontal(|ui| {
-            ui.label("Size");
-            ui.add(egui::Slider::new(&mut self.thumb_size, 80.0..=320.0).suffix(" px").integer());
+    fn settings_browsing(&mut self, ui: &mut egui::Ui) {
+        setting_row(ui, "Layout", "Show a large preview of the selection next to the thumbnails.", |ui| {
+            segmented(ui, &mut self.settings.three_pane, &[(false, "Two panes"), (true, "With preview")]);
         });
-        ui.checkbox(&mut self.settings.show_dates, "Show file date");
-
-        ui.separator();
-        heading(ui, "VIEWER");
-        ui.horizontal(|ui| {
-            ui.label("Mouse wheel");
-            ui.selectable_value(&mut self.settings.wheel_zooms, true, "Zoom");
-            ui.selectable_value(&mut self.settings.wheel_zooms, false, "Next image");
+        setting_row(ui, "Thumbnail size", "", |ui| {
+            // Right-to-left row: value label first so it ends up after the slider.
+            ui.label(egui::RichText::new(format!("{:.0} px", self.thumb_size)).color(theme::p().text_dim));
+            ui.add(egui::Slider::new(&mut self.thumb_size, 80.0..=320.0).show_value(false));
         });
-        ui.checkbox(&mut self.settings.show_info_bar, "Show info bar");
+        setting_row(ui, "Show file date", "Modification time under each thumbnail.", |ui| {
+            toggle(ui, &mut self.settings.show_dates);
+        });
+    }
 
-        ui.separator();
-        heading(ui, "EDITOR");
-        // A plain list rather than a combo box: a dropdown nested inside this popup menu
-        // doesn't open reliably, and there are only a handful of choices anyway.
+    fn settings_viewer(&mut self, ui: &mut egui::Ui) {
+        setting_row(ui, "Mouse wheel", "Ctrl + wheel always zooms.", |ui| {
+            segmented(ui, &mut self.settings.wheel_zooms, &[(true, "Zoom"), (false, "Next image")]);
+        });
+        setting_row(ui, "Info bar", "File name, size and zoom at the bottom of the viewer.", |ui| {
+            toggle(ui, &mut self.settings.show_info_bar);
+        });
+    }
+
+    fn settings_editor(&mut self, ui: &mut egui::Ui) {
+        let p = theme::p();
+        ui.label(egui::RichText::new("Press E, or right-click an image and choose Edit, to open it in this program.").color(p.text_dim));
+        ui.add_space(12.0);
         let custom = self.settings.editor.clone().filter(|c| !self.detected_editors.contains(c));
         let mut choices: Vec<Option<PathBuf>> = vec![None];
         choices.extend(self.detected_editors.iter().cloned().map(Some));
         choices.extend(custom.map(Some));
+        let icon_px = (32.0 * ui.ctx().pixels_per_point()).ceil() as u32;
         for choice in choices {
-            let name = choice.as_deref().map_or("Windows default".to_owned(), crate::editor::name);
+            let icon = choice.as_ref().and_then(|exe| self.file_icon(exe, icon_px));
             let selected = self.settings.editor == choice;
-            let resp = ui.add(egui::Button::selectable(selected, name));
-            let resp = match &choice {
-                Some(exe) => resp.on_hover_text(exe.display().to_string()),
-                None => resp.on_hover_text("Use the program Windows opens for \"Edit\""),
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::click());
+            let painter = ui.painter();
+            let (fill, stroke) = if selected {
+                (p.accent_soft, Stroke::new(1.5, p.accent))
+            } else if resp.hovered() {
+                (p.surface_hover, Stroke::new(1.0, p.border))
+            } else {
+                (p.surface, Stroke::new(1.0, p.border))
             };
+            painter.rect(rect, CornerRadius::same(10), fill, stroke, egui::StrokeKind::Inside);
+            let icon_rect = Rect::from_center_size(pos2(rect.min.x + 32.0, rect.center().y), vec2(32.0, 32.0));
+            match icon {
+                Some(tex) => {
+                    painter.image(tex, icon_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                }
+                None => icons::paint(painter, icon_rect.shrink(4.0), Icon::TwoPane, p.text_dim),
+            }
+            let (title, detail) = match &choice {
+                Some(exe) => (crate::editor::name(exe), exe.display().to_string()),
+                None => ("Windows default".to_owned(), "The program Windows uses to edit this file type".to_owned()),
+            };
+            let text_x = rect.min.x + 62.0;
+            painter.text(pos2(text_x, rect.center().y - 9.0), Align2::LEFT_CENTER, title, FontId::proportional(14.5), p.text_strong);
+            let mut job = LayoutJob::single_section(
+                detail,
+                TextFormat { font_id: FontId::proportional(11.5), color: p.text_dim, ..Default::default() },
+            );
+            job.wrap = TextWrapping::truncate_at_width(rect.max.x - 48.0 - text_x);
+            let galley = painter.layout_job(job);
+            painter.galley(pos2(text_x, rect.center().y + 3.0), galley, p.text_dim);
+            // Radio marker
+            let radio = pos2(rect.max.x - 24.0, rect.center().y);
+            painter.circle_stroke(radio, 8.0, Stroke::new(1.5, if selected { p.accent } else { p.text_dim }));
+            if selected {
+                painter.circle_filled(radio, 4.5, p.accent);
+            }
             if resp.clicked() {
                 self.settings.editor = choice;
             }
+            ui.add_space(8.0);
         }
-        if ui.button("Browse for another program…").clicked() {
+        ui.add_space(4.0);
+        let browse = egui::Button::new("Choose another program…")
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(CornerRadius::same(8))
+            .min_size(vec2(0.0, 32.0));
+        if ui.add(browse).clicked() {
             if let Some(exe) = crate::editor::pick_program() {
                 self.settings.editor = Some(exe);
             }
         }
+    }
 
-        ui.separator();
-        heading(ui, "DEVELOPER");
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.settings.perf_log, "Write performance log");
-            if self.settings.perf_log && ui.small_button("Show file").clicked() {
-                ops::reveal(&crate::perflog::path());
-            }
+    fn settings_developer(&mut self, ui: &mut egui::Ui) {
+        setting_row(ui, "Performance log", "Records decode times and image sizes for every file loaded.", |ui| {
+            toggle(ui, &mut self.settings.perf_log);
         });
-
-        ui.separator();
-        ui.label(egui::RichText::new(concat!("Cyclops ", env!("CARGO_PKG_VERSION"))).small().color(theme::p().text_dim));
+        if self.settings.perf_log {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(crate::perflog::path().display().to_string()).small().color(theme::p().text_dim));
+                if ui.small_button("Show in Explorer").clicked() {
+                    ops::reveal(&crate::perflog::path());
+                }
+            });
+        }
     }
 
     fn folder_tree(&mut self, ui: &mut egui::Ui) {
@@ -1966,6 +2101,63 @@ fn video_badge(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
     icons::paint(painter, Rect::from_center_size(center, Vec2::splat(radius * 1.1)), Icon::Play, Color32::WHITE);
 }
 
+/// A settings row: title and optional description on the left, the control on the right.
+fn setting_row(ui: &mut egui::Ui, title: &str, description: &str, control: impl FnOnce(&mut egui::Ui)) {
+    let p = theme::p();
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width((ui.available_width() - 250.0).max(160.0));
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(egui::RichText::new(title).size(14.0).color(p.text));
+            if !description.is_empty() {
+                ui.label(egui::RichText::new(description).size(12.0).color(p.text_dim));
+            }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
+    });
+    ui.add_space(18.0);
+}
+
+/// A row of mutually exclusive options in one rounded track. Returns true when changed.
+fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) -> bool {
+    let p = theme::p();
+    let mut changed = false;
+    egui::Frame::NONE.fill(p.bg).corner_radius(CornerRadius::same(9)).inner_margin(egui::Margin::same(3)).show(ui, |ui| {
+        // Explicit left-to-right: rows place controls right-to-left, which would reverse the options.
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (option, label) in options {
+                let selected = *value == *option;
+                let text = egui::RichText::new(*label).color(if selected { p.text_strong } else { p.text_dim });
+                let button = egui::Button::new(text)
+                    .fill(if selected { p.surface_hover } else { Color32::TRANSPARENT })
+                    .stroke(if selected { Stroke::new(1.0, p.border) } else { Stroke::NONE })
+                    .corner_radius(CornerRadius::same(7))
+                    .min_size(vec2(84.0, 28.0));
+                if ui.add(button).clicked() && !selected {
+                    *value = *option;
+                    changed = true;
+                }
+            }
+        });
+    });
+    changed
+}
+
+/// An on/off switch.
+fn toggle(ui: &mut egui::Ui, on: &mut bool) {
+    let p = theme::p();
+    let (rect, resp) = ui.allocate_exact_size(vec2(40.0, 22.0), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+    }
+    let t = ui.ctx().animate_bool_responsive(resp.id, *on);
+    let track = if *on { p.accent } else { p.border };
+    ui.painter().rect_filled(rect, CornerRadius::same(11), track);
+    let x = egui::lerp((rect.min.x + 11.0)..=(rect.max.x - 11.0), t);
+    ui.painter().circle_filled(pos2(x, rect.center().y), 8.0, Color32::WHITE);
+}
+
 /// The right-click menu for a file or folder.
 fn file_menu(ui: &mut egui::Ui, edit_label: &str, index: usize, entry: &Entry, include_open: bool, action: &mut Option<FileAction>) {
     let parent = entry.path.parent().map(Path::to_path_buf);
@@ -2372,6 +2564,7 @@ impl eframe::App for CyclopsApp {
 
         // F, F11 and Alt+Enter toggle fullscreen everywhere (unless typing in a text field).
         let fullscreen_key = self.dialog.is_none()
+            && self.settings_page.is_none()
             && !ctx.egui_wants_keyboard_input()
             && ctx.input(|i| {
                 i.key_pressed(Key::F11) || (i.key_pressed(Key::F) && i.modifiers.is_none()) || (i.modifiers.alt && i.key_pressed(Key::Enter))
@@ -2382,7 +2575,7 @@ impl eframe::App for CyclopsApp {
             self.set_fullscreen(&ctx, false);
         }
         // While a dialog is open it owns the keyboard (Enter/Esc/Del must not reach the views).
-        if self.dialog.is_some() {
+        if self.dialog.is_some() || self.settings_page.is_some() {
         } else if self.viewer.is_some() {
             self.viewer_input(&ctx);
         } else {
@@ -2432,6 +2625,7 @@ impl eframe::App for CyclopsApp {
         }
         self.apply_pending_action();
         self.dialogs(&ctx);
+        self.settings_window(&ctx);
         self.draw_toast(&ctx);
         self.evict_thumbs();
     }
