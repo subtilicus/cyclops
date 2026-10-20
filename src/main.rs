@@ -3,6 +3,7 @@
 mod app;
 mod chrome;
 mod decode;
+mod diag;
 mod editor;
 mod fs;
 mod glass;
@@ -19,12 +20,18 @@ mod wic;
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
+    diag::init();
     let start = std::env::args_os().nth(1).map(PathBuf::from);
-    // Present through DirectComposition so the window can be translucent (Mica/Acrylic).
-    // Plain HWND swapchains can't do alpha. Respect an explicit override.
-    if std::env::var_os("WGPU_DX12_PRESENTATION_SYSTEM").is_none() {
-        // SAFETY: single-threaded at this point, before any other thread or the renderer starts.
-        unsafe { std::env::set_var("WGPU_DX12_PRESENTATION_SYSTEM", "Visual") };
+    // Windows: render with DirectX 12 and present through DirectComposition, the only
+    // combination whose swapchain supports alpha, which the translucent Mica/Acrylic window
+    // needs. (wgpu otherwise often picks Vulkan, whose Windows surfaces are opaque.)
+    // Explicit overrides in the environment are respected.
+    #[cfg(windows)]
+    for (key, value) in [("WGPU_BACKEND", "dx12"), ("WGPU_DX12_PRESENTATION_SYSTEM", "Visual")] {
+        if std::env::var_os(key).is_none() {
+            // SAFETY: single-threaded at this point, before any other thread or the renderer starts.
+            unsafe { std::env::set_var(key, value) };
+        }
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

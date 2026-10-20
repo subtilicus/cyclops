@@ -457,6 +457,8 @@ impl CyclopsApp {
         theme::install(&cc.egui_ctx);
         if let Some(rs) = &cc.wgpu_render_state {
             crate::hdr_gpu::init(rs);
+            let info = rs.adapter.get_info();
+            log::info!("adapter: {} ({:?}, {:?}), target format {:?}", info.name, info.backend, info.device_type, rs.target_format);
         }
         cc.egui_ctx.set_theme(settings.skin.preference());
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
@@ -1142,7 +1144,7 @@ impl CyclopsApp {
     }
 
     fn settings_developer(&mut self, ui: &mut egui::Ui) {
-        setting_row(ui, "Performance log", "Records decode times and image sizes for every file loaded.", |ui| {
+        setting_row(ui, "Developer log", "Decode times, GPU and window setup, and warnings. Startup lines are included too.", |ui| {
             toggle(ui, &mut self.settings.perf_log);
         });
         if self.settings.perf_log {
@@ -2606,7 +2608,7 @@ impl eframe::App for CyclopsApp {
             crate::chrome::style(frame, dark, material, p.panel, p.text, p.border);
             self.chrome_state = Some((dark, material));
         }
-        crate::perflog::ENABLED.store(self.settings.perf_log, std::sync::atomic::Ordering::Relaxed);
+        crate::perflog::set_enabled(self.settings.perf_log);
         // Coming back to the window (e.g. from the photo editor): pick up changed files.
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if focused && !self.was_focused {

@@ -511,6 +511,7 @@ dependencies = [
  "egui",
  "half",
  "image",
+ "log",
  "psd",
  "raw-window-handle",
  "rayon",
