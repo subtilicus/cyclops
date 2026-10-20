@@ -909,61 +909,68 @@ impl CyclopsApp {
                 self.refresh();
             }
             ui.add_space(6.0);
-            let slider_w = 490.0;
-            let edit = egui::TextEdit::singleline(&mut self.path_edit)
-                .desired_width(ui.available_width() - slider_w - 16.0)
-                .margin(vec2(8.0, 5.0));
-            let resp = ui.add(edit);
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                let typed = self.path_edit.trim();
-                let p = if typed.eq_ignore_ascii_case("network") { PathBuf::from(shell::NETWORK) } else { PathBuf::from(typed) };
-                if p.is_dir() || fs::is_virtual(&p) {
-                    self.navigate(p);
-                } else if p.is_file() {
-                    if let Some(parent) = p.parent() {
-                        self.navigate(parent.to_path_buf());
-                    }
-                    if let Some(i) = self.entries.iter().position(|e| e.path == p) {
-                        self.open_viewer(i);
+            // Right-hand controls are laid out from the right edge (so the cog is always flush
+            // right); the address bar then takes whatever width is left. Items are added in
+            // reverse visual order.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if icons::button(ui, Icon::Cog, true, "Settings").clicked() {
+                    self.settings_page = Some(self.settings_page.unwrap_or(SettingsPage::Appearance));
+                }
+                ui.add_space(4.0);
+                if icons::toggle(ui, Icon::ThreePane, self.settings.three_pane, "Three panes: folders, thumbnails and preview")
+                    .clicked()
+                {
+                    self.settings.three_pane = true;
+                }
+                if icons::toggle(ui, Icon::TwoPane, !self.settings.three_pane, "Two panes: folders and thumbnails").clicked() {
+                    self.settings.three_pane = false;
+                }
+                ui.add_space(8.0);
+                ui.add(egui::Slider::new(&mut self.thumb_size, 80.0..=320.0).show_value(false));
+                let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                icons::paint(ui.painter(), r, Icon::Grid, theme::p().text_dim);
+                ui.add_space(8.0);
+
+                let before = (self.sort_key, self.sort_desc);
+                let (dir_icon, dir_tip) = if self.sort_desc { (Icon::Down, "Descending") } else { (Icon::Up, "Ascending") };
+                if icons::button(ui, dir_icon, true, dir_tip).clicked() {
+                    self.sort_desc = !self.sort_desc;
+                }
+                egui::ComboBox::from_id_salt("sort")
+                    .selected_text(self.sort_key.label())
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        for key in SortKey::ALL {
+                            ui.selectable_value(&mut self.sort_key, key, key.label());
+                        }
+                    });
+                let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+                icons::paint(ui.painter(), r, Icon::Sort, theme::p().text_dim);
+                if before != (self.sort_key, self.sort_desc) {
+                    self.resort();
+                }
+                ui.add_space(8.0);
+
+                let edit = egui::TextEdit::singleline(&mut self.path_edit)
+                    .desired_width(ui.available_width())
+                    .margin(vec2(8.0, 5.0));
+                let resp = ui.add(edit);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    let typed = self.path_edit.trim();
+                    let p = if typed.eq_ignore_ascii_case("network") { PathBuf::from(shell::NETWORK) } else { PathBuf::from(typed) };
+                    if p.is_dir() || fs::is_virtual(&p) {
+                        self.navigate(p);
+                    } else if p.is_file() {
+                        if let Some(parent) = p.parent() {
+                            self.navigate(parent.to_path_buf());
+                        }
+                        if let Some(i) = self.entries.iter().position(|e| e.path == p) {
+                            self.open_viewer(i);
+                        }
                     }
                 }
-            }
-            ui.add_space(8.0);
-            let before = (self.sort_key, self.sort_desc);
-            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-            icons::paint(ui.painter(), r, Icon::Sort, theme::p().text_dim);
-            egui::ComboBox::from_id_salt("sort")
-                .selected_text(self.sort_key.label())
-                .width(130.0)
-                .show_ui(ui, |ui| {
-                    for key in SortKey::ALL {
-                        ui.selectable_value(&mut self.sort_key, key, key.label());
-                    }
-                });
-            let (dir_icon, dir_tip) = if self.sort_desc { (Icon::Down, "Descending") } else { (Icon::Up, "Ascending") };
-            if icons::button(ui, dir_icon, true, dir_tip).clicked() {
-                self.sort_desc = !self.sort_desc;
-            }
-            if before != (self.sort_key, self.sort_desc) {
-                self.resort();
-            }
-            ui.add_space(8.0);
-            let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-            icons::paint(ui.painter(), r, Icon::Grid, theme::p().text_dim);
-            ui.add(egui::Slider::new(&mut self.thumb_size, 80.0..=320.0).show_value(false));
-            ui.add_space(8.0);
-            if icons::toggle(ui, Icon::TwoPane, !self.settings.three_pane, "Two panes: folders and thumbnails").clicked() {
-                self.settings.three_pane = false;
-            }
-            if icons::toggle(ui, Icon::ThreePane, self.settings.three_pane, "Three panes: folders, thumbnails and preview")
-                .clicked()
-            {
-                self.settings.three_pane = true;
-            }
-            ui.add_space(4.0);
-            if icons::button(ui, Icon::Cog, true, "Settings").clicked() {
-                self.settings_page = Some(self.settings_page.unwrap_or(SettingsPage::Appearance));
-            }
+            });
         });
     }
 
