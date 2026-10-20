@@ -86,6 +86,8 @@ struct Settings {
     perf_log: bool,
     /// External photo editor; `None` uses Windows' "Edit" action.
     editor: Option<PathBuf>,
+    /// Window material behind the translucent chrome.
+    material: crate::chrome::Material,
     /// Width of the preview pane in points.
     preview_width: f32,
 }
@@ -415,8 +417,8 @@ pub struct CyclopsApp {
     detected_editors: Vec<PathBuf>,
     /// Window focus last frame; regaining focus re-syncs the folder (e.g. after editing).
     was_focused: bool,
-    /// Skin the native title bar was last styled for.
-    chrome_dark: Option<bool>,
+    /// Skin and material the native window was last styled for.
+    chrome_state: Option<(bool, crate::chrome::Material)>,
     dialog: Option<Dialog>,
     /// A short message (e.g. a failed delete) and when it was posted.
     toast: Option<(String, f64)>,
@@ -447,6 +449,9 @@ impl CyclopsApp {
             three_pane: flag("three_pane", false),
             perf_log: flag("perf_log", false),
             editor: stored("editor").filter(|s| !s.is_empty()).map(PathBuf::from),
+            material: stored("material")
+                .and_then(|s| crate::chrome::Material::from_label(&s))
+                .unwrap_or(crate::chrome::Material::Mica),
             preview_width: stored("preview_width").and_then(|s| s.parse().ok()).unwrap_or(460.0),
         };
         theme::install(&cc.egui_ctx);
@@ -507,7 +512,7 @@ impl CyclopsApp {
             settings_page: None,
             detected_editors: crate::editor::detect(),
             was_focused: true,
-            chrome_dark: None,
+            chrome_state: None,
             dialog: None,
             toast: None,
             preview_view: ZoomPan::default(),
@@ -1036,6 +1041,15 @@ impl CyclopsApp {
                 ui.ctx().set_theme(self.settings.skin.preference());
             }
         });
+        setting_row(
+            ui,
+            "Window material",
+            "Mica tints the window with your wallpaper; Acrylic shows a frosted view of what's behind it (Windows 11).",
+            |ui| {
+                let options = crate::chrome::Material::ALL.map(|m| (m, m.label()));
+                segmented(ui, &mut self.settings.material, &options);
+            },
+        );
     }
 
     fn settings_browsing(&mut self, ui: &mut egui::Ui) {
@@ -2433,6 +2447,16 @@ impl CyclopsApp {
         self.dialog = Some(Dialog::Rename { path, text, error: None, fresh: true });
     }
 
+    /// A chrome surface colour: opaque for the Solid material, otherwise translucent so the
+    /// Mica/Acrylic backdrop shows through (`opacity` 0–1).
+    fn chrome_fill(&self, color: Color32, opacity: f32) -> Color32 {
+        if self.settings.material.translucent() {
+            Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (opacity * 255.0) as u8)
+        } else {
+            color
+        }
+    }
+
     fn edit_label(&self) -> String {
         match &self.settings.editor {
             Some(exe) => format!("Edit in {}", crate::editor::name(exe)),
@@ -2576,10 +2600,11 @@ impl eframe::App for CyclopsApp {
         self.backdrop = None;
         // Native title bar follows the skin (caption matching the toolbar, rounded corners).
         let dark = ctx.theme() == egui::Theme::Dark;
-        if self.chrome_dark != Some(dark) {
+        let material = self.settings.material;
+        if self.chrome_state != Some((dark, material)) {
             let p = theme::p();
-            crate::chrome::style(frame, dark, p.panel, p.text, p.border);
-            self.chrome_dark = Some(dark);
+            crate::chrome::style(frame, dark, material, p.panel, p.text, p.border);
+            self.chrome_state = Some((dark, material));
         }
         crate::perflog::ENABLED.store(self.settings.perf_log, std::sync::atomic::Ordering::Relaxed);
         // Coming back to the window (e.g. from the photo editor): pick up changed files.
@@ -2625,16 +2650,16 @@ impl eframe::App for CyclopsApp {
                 .show(ui, |ui| self.viewer(ui));
         } else {
             egui::Panel::top("toolbar")
-                .frame(egui::Frame::NONE.fill(theme::p().panel).inner_margin(egui::Margin::symmetric(10, 8)))
+                .frame(egui::Frame::NONE.fill(self.chrome_fill(theme::p().panel, 0.6)).inner_margin(egui::Margin::symmetric(10, 8)))
                 .show(ui, |ui| self.toolbar(ui));
             egui::Panel::bottom("status")
-                .frame(egui::Frame::NONE.fill(theme::p().panel).inner_margin(egui::Margin::symmetric(12, 4)))
+                .frame(egui::Frame::NONE.fill(self.chrome_fill(theme::p().panel, 0.6)).inner_margin(egui::Margin::symmetric(12, 4)))
                 .show(ui, |ui| self.status_bar(ui));
             egui::Panel::left("tree")
                 .resizable(true)
                 .default_size(250.0)
                 .size_range(160.0..=500.0)
-                .frame(egui::Frame::NONE.fill(theme::p().panel).inner_margin(egui::Margin::symmetric(6, 8)))
+                .frame(egui::Frame::NONE.fill(self.chrome_fill(theme::p().panel, 0.6)).inner_margin(egui::Margin::symmetric(6, 8)))
                 .show(ui, |ui| self.folder_tree(ui));
             // The preview width is owned by us (not egui's panel state) so a drag always sticks.
             let preview = self.settings.three_pane.then(|| {
@@ -2644,13 +2669,13 @@ impl eframe::App for CyclopsApp {
                     .resizable(false)
                     .show_separator_line(false)
                     .exact_size(self.settings.preview_width)
-                    .frame(egui::Frame::NONE.fill(theme::p().panel).inner_margin(egui::Margin::same(12)))
+                    .frame(egui::Frame::NONE.fill(self.chrome_fill(theme::p().panel, 0.6)).inner_margin(egui::Margin::same(12)))
                     .show(ui, |ui| self.preview(ui))
                     .response
                     .rect
             });
             egui::CentralPanel::no_frame()
-                .frame(egui::Frame::NONE.fill(theme::p().bg))
+                .frame(egui::Frame::NONE.fill(self.chrome_fill(theme::p().bg, 0.35)))
                 .show(ui, |ui| self.grid(ui));
             if let Some(panel) = preview {
                 self.preview_divider(ui, panel);
@@ -2678,6 +2703,7 @@ impl eframe::App for CyclopsApp {
         storage.set_string("video_volume", self.settings.video_volume.to_string());
         storage.set_string("three_pane", self.settings.three_pane.to_string());
         storage.set_string("perf_log", self.settings.perf_log.to_string());
+        storage.set_string("material", self.settings.material.label().to_owned());
         storage.set_string("editor", self.settings.editor.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
         storage.set_string("preview_width", self.settings.preview_width.to_string());
         let places: Vec<String> = self.network_places.iter().map(|p| p.display().to_string()).collect();
@@ -2685,6 +2711,7 @@ impl eframe::App for CyclopsApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        theme::p().bg.to_normalized_gamma_f32()
+        // Fully transparent so the system backdrop shows wherever the UI is translucent.
+        if self.settings.material.translucent() { [0.0; 4] } else { theme::p().bg.to_normalized_gamma_f32() }
     }
 }
