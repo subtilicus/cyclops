@@ -960,30 +960,28 @@ impl CyclopsApp {
 
         ui.separator();
         heading(ui, "EDITOR");
-        let current = self.settings.editor.clone();
-        let label = |p: &Option<PathBuf>| p.as_deref().map_or("Windows default".to_owned(), crate::editor::name);
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("editor")
-                .selected_text(label(&current))
-                .width(160.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.settings.editor, None, "Windows default");
-                    for exe in self.detected_editors.clone() {
-                        let name = crate::editor::name(&exe);
-                        ui.selectable_value(&mut self.settings.editor, Some(exe.clone()), name).on_hover_text(exe.display().to_string());
-                    }
-                    if let Some(custom) = current.clone().filter(|c| !self.detected_editors.contains(c)) {
-                        ui.selectable_value(&mut self.settings.editor, Some(custom.clone()), label(&Some(custom)));
-                    }
-                });
-            if ui.button("Browse…").clicked() {
-                if let Some(exe) = crate::editor::pick_program() {
-                    self.settings.editor = Some(exe);
-                }
+        // A plain list rather than a combo box: a dropdown nested inside this popup menu
+        // doesn't open reliably, and there are only a handful of choices anyway.
+        let custom = self.settings.editor.clone().filter(|c| !self.detected_editors.contains(c));
+        let mut choices: Vec<Option<PathBuf>> = vec![None];
+        choices.extend(self.detected_editors.iter().cloned().map(Some));
+        choices.extend(custom.map(Some));
+        for choice in choices {
+            let name = choice.as_deref().map_or("Windows default".to_owned(), crate::editor::name);
+            let selected = self.settings.editor == choice;
+            let resp = ui.add(egui::Button::selectable(selected, name));
+            let resp = match &choice {
+                Some(exe) => resp.on_hover_text(exe.display().to_string()),
+                None => resp.on_hover_text("Use the program Windows opens for \"Edit\""),
+            };
+            if resp.clicked() {
+                self.settings.editor = choice;
             }
-        });
-        if let Some(p) = &self.settings.editor {
-            ui.label(egui::RichText::new(p.display().to_string()).small().color(theme::p().text_dim));
+        }
+        if ui.button("Browse for another program…").clicked() {
+            if let Some(exe) = crate::editor::pick_program() {
+                self.settings.editor = Some(exe);
+            }
         }
 
         ui.separator();
