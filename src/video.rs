@@ -65,6 +65,8 @@ mod imp {
         shared: Arc<Shared>,
         surfaces: Option<Surfaces>,
         texture: Option<TextureHandle>,
+        /// Tiny blurred copy of the current frame, for frosted-glass controls.
+        backdrop: Option<TextureHandle>,
         pixels: Vec<Color32>,
     }
 
@@ -133,7 +135,7 @@ mod imp {
                 engine.SetAutoPlay(true)?;
                 engine.SetSource(&BSTR::from(path.to_string_lossy().as_ref()))?;
 
-                Ok(Self { engine, device, context, shared, surfaces: None, texture: None, pixels: Vec::new() })
+                Ok(Self { engine, device, context, shared, surfaces: None, texture: None, backdrop: None, pixels: Vec::new() })
             }
         }
 
@@ -152,6 +154,10 @@ mod imp {
 
         pub fn texture(&self) -> Option<&TextureHandle> {
             self.texture.as_ref()
+        }
+
+        pub fn backdrop(&self) -> Option<&TextureHandle> {
+            self.backdrop.as_ref()
         }
 
         pub fn is_playing(&self) -> bool {
@@ -237,6 +243,11 @@ mod imp {
                     self.pixels.extend(row.chunks_exact(4).map(|p| Color32::from_rgb(p[0], p[1], p[2])));
                 }
                 self.context.Unmap(&surfaces.staging, 0);
+                let blurred = crate::glass::blurred(&self.pixels, [w, h]);
+                match &mut self.backdrop {
+                    Some(t) => t.set(blurred, TextureOptions::LINEAR),
+                    None => self.backdrop = Some(ctx.load_texture("video-backdrop", blurred, TextureOptions::LINEAR)),
+                }
                 let image = ColorImage::new([w, h], std::mem::take(&mut self.pixels));
                 match &mut self.texture {
                     Some(t) => t.set(image, TextureOptions::LINEAR),
@@ -300,6 +311,9 @@ mod imp {
             None
         }
         pub fn texture(&self) -> Option<&TextureHandle> {
+            None
+        }
+        pub fn backdrop(&self) -> Option<&TextureHandle> {
             None
         }
         pub fn is_playing(&self) -> bool {

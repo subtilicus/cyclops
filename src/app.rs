@@ -114,6 +114,8 @@ struct FullImage {
     paused_at: Option<f32>,
     /// HDR/EXR linear data and the exposure (EV) being shown.
     hdr: Option<HdrEdit>,
+    /// Tiny blurred copy for frosted-glass overlays.
+    blur: Option<TextureHandle>,
 }
 
 struct HdrEdit {
@@ -405,6 +407,8 @@ pub struct CyclopsApp {
     fullscreen: bool,
     pending_key_zoom: f32,
     pending_action: Option<FileAction>,
+    /// What's behind glass overlays this frame (set when the viewer/preview draws its image).
+    backdrop: Option<crate::glass::Backdrop>,
     /// The settings window, if open, and the page it shows.
     settings_page: Option<SettingsPage>,
     /// Photo editors found on this PC (for the settings menu).
@@ -499,6 +503,7 @@ impl CyclopsApp {
             pending_key_zoom: 1.0,
             video: None,
             pending_action: None,
+            backdrop: None,
             settings_page: None,
             detected_editors: crate::editor::detect(),
             was_focused: true,
@@ -790,6 +795,7 @@ impl CyclopsApp {
                                         (ctx.load_texture(format!("{name}#{i}"), img, TextureOptions::LINEAR), secs)
                                     })
                                     .collect(),
+                                blur: images.blur.map(|b| ctx.load_texture(format!("{name}#blur"), b, TextureOptions::LINEAR)),
                                 ready_at: ctx.input(|i| i.time),
                                 paused_at: None,
                                 hdr: images.hdr.zip(self.render_state.as_ref()).and_then(|(hdr, rs)| {
@@ -1715,6 +1721,18 @@ impl CyclopsApp {
             } else if tex_id != egui::TextureId::default() {
                 ui.painter().with_clip_rect(rect).image(tex_id, draw, uv, Color32::WHITE);
             }
+            let blur = if entry.is_video {
+                match &self.video {
+                    Some((_, Ok(p))) => p.backdrop().map(|t| t.id()),
+                    _ => None,
+                }
+            } else {
+                match self.full.get(&entry.path) {
+                    Some(Full::Ready(img)) => img.blur.as_ref().map(|t| t.id()),
+                    _ => None,
+                }
+            };
+            self.backdrop = blur.map(|texture| crate::glass::Backdrop { texture, draw });
         }
         self.pending_key_zoom = 1.0;
 
@@ -1775,7 +1793,7 @@ impl CyclopsApp {
             pos2(rect.center().x, rect.max.y - 30.0),
             galley.size() + vec2(28.0, 14.0),
         );
-        painter.rect(pill, CornerRadius::same(255), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
+        crate::glass::paint(&painter, pill, 255.0, self.backdrop);
         painter.galley(pill.min + vec2(14.0, 7.0), galley, theme::DARK.text);
     }
 }
@@ -1875,6 +1893,10 @@ impl CyclopsApp {
                         ui.painter().with_clip_rect(img_rect).image(tex, draw, uv, Color32::WHITE);
                     }
                 }
+                self.backdrop = match self.full.get(&entry.path) {
+                    Some(Full::Ready(img)) => img.blur.as_ref().map(|t| crate::glass::Backdrop { texture: t.id(), draw }),
+                    _ => None,
+                };
             }
             self.exposure_control(ui, img_rect, &entry.path);
             self.animation_controls(ui, img_rect, &entry.path, 30.0);
@@ -1953,7 +1975,7 @@ impl CyclopsApp {
         let now = ctx.input(|i| i.time);
         let mut painter = ui.painter().clone();
         painter.multiply_opacity(alpha);
-        painter.rect(bar, CornerRadius::same(14), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
+        crate::glass::paint(&painter, bar, 14.0, self.backdrop);
         let (fg, cy) = (theme::DARK.text, bar.center().y);
 
         let play = Rect::from_center_size(pos2(bar.min.x + 24.0, cy), vec2(30.0, 30.0));
@@ -2003,7 +2025,7 @@ impl CyclopsApp {
 
         let mut painter = ui.painter().clone();
         painter.multiply_opacity(alpha);
-        painter.rect(bar, CornerRadius::same(14), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
+        crate::glass::paint(&painter, bar, 14.0, self.backdrop);
         let fg = theme::DARK.text;
         let cy = bar.center().y;
 
@@ -2491,7 +2513,7 @@ impl CyclopsApp {
         let painter = ui.painter().clone();
         let fg = theme::DARK.text;
         let pill = Rect::from_center_size(pos2(area.center().x, area.min.y + 30.0), vec2(480.0_f32.min(area.width() - 24.0), 36.0));
-        painter.rect(pill, CornerRadius::same(12), Color32::from_black_alpha(170), Stroke::new(1.0, Color32::from_white_alpha(18)), egui::StrokeKind::Inside);
+        crate::glass::paint(&painter, pill, 12.0, self.backdrop);
         let cy = pill.center().y;
         painter.text(pos2(pill.min.x + 14.0, cy), Align2::LEFT_CENTER, "Exposure", FontId::proportional(12.5), fg);
 
@@ -2551,6 +2573,7 @@ impl eframe::App for CyclopsApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         theme::sync(&ctx);
+        self.backdrop = None;
         // Native title bar follows the skin (caption matching the toolbar, rounded corners).
         let dark = ctx.theme() == egui::Theme::Dark;
         if self.chrome_dark != Some(dark) {

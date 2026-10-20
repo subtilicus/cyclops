@@ -5,6 +5,7 @@ mod chrome;
 mod decode;
 mod editor;
 mod fs;
+mod glass;
 mod hdr_gpu;
 mod icons;
 mod loader;
