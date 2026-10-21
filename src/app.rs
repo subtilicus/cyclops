@@ -118,11 +118,14 @@ struct FullImage {
     hdr: Option<HdrEdit>,
     /// Tiny blurred copy for frosted-glass overlays.
     blur: Option<TextureHandle>,
+    bit_depth: Option<crate::decode::BitDepth>,
 }
 
 struct HdrEdit {
     gpu: crate::hdr_gpu::HdrTexture,
     auto_exposure: f32,
+    /// ACES tone mapping (scene-referred) vs plain clipping (display-referred).
+    tonemap: bool,
     /// Stops relative to auto exposure.
     ev: f32,
 }
@@ -802,12 +805,13 @@ impl CyclopsApp {
                                         (ctx.load_texture(format!("{name}#{i}"), img, TextureOptions::LINEAR), secs)
                                     })
                                     .collect(),
+                                bit_depth: images.bit_depth,
                                 blur: images.blur.map(|b| ctx.load_texture(format!("{name}#blur"), b, TextureOptions::LINEAR)),
                                 ready_at: ctx.input(|i| i.time),
                                 paused_at: None,
                                 hdr: images.hdr.zip(self.render_state.as_ref()).and_then(|(hdr, rs)| {
                                     let gpu = crate::hdr_gpu::upload(rs, &hdr.levels)?;
-                                    Some(HdrEdit { gpu, auto_exposure: hdr.auto_exposure, ev: 0.0 })
+                                    Some(HdrEdit { gpu, auto_exposure: hdr.auto_exposure, tonemap: hdr.tonemap, ev: 0.0 })
                                 }),
                                 main: ctx.load_texture(name.clone(), images.main, TextureOptions::LINEAR),
                                 screen: images
@@ -1736,7 +1740,7 @@ impl CyclopsApp {
                 },
             };
             let hdr_shape = match self.full.get(&entry.path) {
-                Some(Full::Ready(FullImage { hdr: Some(h), .. })) => h.gpu.paint(draw, rect, h.exposure()),
+                Some(Full::Ready(FullImage { hdr: Some(h), .. })) => h.gpu.paint(draw, rect, h.exposure(), h.tonemap),
                 _ => None,
             };
             if let Some(shape) = hdr_shape {
@@ -1801,6 +1805,9 @@ impl CyclopsApp {
         let mut info = format!("{}    {}/{}", entry.name, pos_in_folder, total);
         if let Some(s) = source_size {
             info += &format!("    {}×{}", s.x as u32, s.y as u32);
+        }
+        if let Some(Full::Ready(FullImage { bit_depth: Some(depth), .. })) = self.full.get(&entry.path) {
+            info += &format!("    {}", depth.label());
         }
         info += &format!("    {}", fs::human_size(entry.size));
         if let Some(z) = zoom_pct {
@@ -1905,7 +1912,7 @@ impl CyclopsApp {
                     None => thumb.as_ref().map_or(egui::TextureId::default(), |t| t.id()),
                 };
                 let hdr_shape = match self.full.get(&entry.path) {
-                    Some(Full::Ready(FullImage { hdr: Some(h), .. })) => h.gpu.paint(draw, img_rect, h.exposure()),
+                    Some(Full::Ready(FullImage { hdr: Some(h), .. })) => h.gpu.paint(draw, img_rect, h.exposure(), h.tonemap),
                     _ => None,
                 };
                 match hdr_shape {
@@ -1925,6 +1932,9 @@ impl CyclopsApp {
             self.animation_controls(ui, img_rect, &entry.path, 30.0);
             if let Some((size, ..)) = &full {
                 details.push(format!("{}×{}", size.x as u32, size.y as u32));
+                if let Some(Full::Ready(FullImage { bit_depth: Some(depth), .. })) = self.full.get(&entry.path) {
+                    details.push(depth.label());
+                }
             } else if let Some(Full::Failed(e)) = self.full.get(&entry.path) {
                 details.push(format!("error: {e}"));
             }

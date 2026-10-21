@@ -1,4 +1,4 @@
-//! GPU tone mapping for HDR/EXR images.
+//! GPU tone mapping for high-precision images (HDR/EXR, 16-bit, deep HEIC/AVIF/RAW).
 //!
 //! The linear-light pixels are uploaded once as a mipmapped half-float texture; a small shader
 //! applies exposure, the ACES filmic curve and sRGB encoding while drawing. Changing exposure
@@ -18,7 +18,8 @@ struct Params {
     uv_max: vec2<f32>,
     exposure: f32,
     encode_srgb: f32,
-    _pad: vec2<f32>,
+    clip_only: f32,
+    _pad: f32,
 };
 
 @group(0) @binding(0) var tex: texture_2d<f32>;
@@ -52,7 +53,9 @@ fn to_srgb(c: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs(in: VertexOut) -> @location(0) vec4<f32> {
     let texel = textureSample(tex, samp, in.uv);
-    var rgb = aces(max(texel.rgb * params.exposure, vec3<f32>(0.0)));
+    let exposed = max(texel.rgb * params.exposure, vec3<f32>(0.0));
+    // Display-referred sources (16-bit photos) just clip; scene-referred HDR is tone-mapped.
+    var rgb = select(aces(exposed), min(exposed, vec3<f32>(1.0)), params.clip_only > 0.5);
     if (params.encode_srgb > 0.5) {
         rgb = to_srgb(rgb);
     }
@@ -68,7 +71,8 @@ struct Params {
     uv_max: [f32; 2],
     exposure: f32,
     encode_srgb: f32,
-    _pad: [f32; 2],
+    clip_only: f32,
+    _pad: f32,
 }
 
 struct Uploaded {
@@ -241,7 +245,7 @@ pub fn upload(render_state: &egui_wgpu::RenderState, levels: &[HdrLevel]) -> Opt
 
 impl HdrTexture {
     /// A paint shape drawing this image into `draw` (clipped to `clip`) at `exposure`.
-    pub fn paint(&self, draw: Rect, clip: Rect, exposure: f32) -> Option<egui::Shape> {
+    pub fn paint(&self, draw: Rect, clip: Rect, exposure: f32, tonemap: bool) -> Option<egui::Shape> {
         let visible = draw.intersect(clip);
         if !visible.is_positive() {
             return None;
@@ -254,7 +258,8 @@ impl HdrTexture {
                 uv_max: uv(visible.max).into(),
                 exposure,
                 encode_srgb: 0.0, // filled in prepare
-                _pad: [0.0; 2],
+                clip_only: if tonemap { 0.0 } else { 1.0 },
+                _pad: 0.0,
             },
         };
         Some(egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(visible, callback)))

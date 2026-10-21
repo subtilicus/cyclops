@@ -50,6 +50,35 @@ fn is_jpeg(path: &Path) -> bool {
         .is_some_and(|e| ["jpg", "jpeg", "jpe", "jfif"].iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
+/// Bits per channel of the source, e.g. 8, 16, or 32-bit float.
+#[derive(Clone, Copy, Debug)]
+pub struct BitDepth {
+    pub bits: u8,
+    pub float: bool,
+}
+
+impl BitDepth {
+    pub const EIGHT: Self = Self { bits: 8, float: false };
+
+    pub fn label(self) -> String {
+        if self.float { format!("{}-bit float", self.bits) } else { format!("{}-bit", self.bits) }
+    }
+
+    /// Deeper than an 8-bit display can show directly (worth an exposure control).
+    pub fn is_deep(self) -> bool {
+        self.bits > 8 || self.float
+    }
+
+    fn of(color: image::ColorType) -> Self {
+        use image::ColorType::*;
+        match color {
+            L16 | La16 | Rgb16 | Rgba16 => Self { bits: 16, float: false },
+            Rgb32F | Rgba32F => Self { bits: 32, float: true },
+            _ => Self::EIGHT,
+        }
+    }
+}
+
 pub struct Decoded {
     /// The (first) image; may already be scaled down for WIC and SVG sources.
     pub image: RgbaImage,
@@ -59,14 +88,15 @@ pub struct Decoded {
     pub source_size: [u32; 2],
     /// Animation frames with their display time in seconds (empty for stills).
     pub frames: Vec<(RgbaImage, f32)>,
-    /// Linear-light data for HDR/EXR, for exposure changes.
+    /// High-precision linear data (HDR/EXR, 16-bit, deep WIC formats), for exposure changes.
     pub hdr: Option<Hdr>,
+    pub bit_depth: Option<BitDepth>,
 }
 
 impl Decoded {
     fn still(image: RgbaImage, opaque: bool) -> Self {
         let source_size = [image.width(), image.height()];
-        Self { image, opaque, source_size, frames: Vec::new(), hdr: None }
+        Self { image, opaque, source_size, frames: Vec::new(), hdr: None, bit_depth: None }
     }
 }
 
@@ -77,12 +107,12 @@ impl Decoded {
 pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Result<Decoded, String> {
     let ext = extension(path);
     if crate::wic::handles(path) {
-        return from_wic(path, max_side).map_err(|e| codec_hint(&ext, e));
+        return from_wic(path, max_side, animate).map_err(|e| codec_hint(&ext, e));
     }
     // TIFFs are often huge (scans, satellite, print). WIC scales while decoding, so a
     // 120-megapixel file never needs a full-size buffer; fall back to `image` if WIC can't.
     if ext == "tif" || ext == "tiff" {
-        if let Ok(d) = from_wic(path, max_side) {
+        if let Ok(d) = from_wic(path, max_side, animate) {
             return Ok(d);
         }
     }
@@ -103,16 +133,58 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
         if let Some(frames) = decode_animation(&bytes, &ext) {
             let image = frames[0].0.clone();
             let source_size = [image.width(), image.height()];
-            return Ok(Decoded { image, opaque: false, source_size, frames, hdr: None });
+            return Ok(Decoded { image, opaque: false, source_size, frames, hdr: None, bit_depth: Some(BitDepth::EIGHT) });
         }
     }
     let img = match load_unlimited(&bytes) {
         Ok(img) => img,
         // Unusual variants (e.g. exotic TIFF compressions) may still be readable by Windows.
-        Err(e) => return from_wic(path, max_side).map_err(|_| e),
+        Err(e) => return from_wic(path, max_side, animate).map_err(|_| e),
     };
     let opaque = !img.color().has_alpha();
-    Ok(Decoded::still(img.to_rgba8(), opaque))
+    let depth = BitDepth::of(img.color());
+    // Deep images keep their precision for exposure editing (full-size requests only).
+    let hdr = (animate && depth.is_deep()).then(|| {
+        let light = if depth.float { Light::Scene } else { Light::DisplaySrgb };
+        high_precision(img.to_rgba32f(), max_side, light)
+    });
+    Ok(Decoded { hdr, bit_depth: Some(depth), ..Decoded::still(img.to_rgba8(), opaque) })
+}
+
+/// How high-precision pixel values relate to light.
+enum Light {
+    /// Scene-referred linear (HDR, EXR, float TIFF): tone-mapped with ACES, auto exposure.
+    Scene,
+    /// Display-referred and already linear (WIC's scRGB): shown as-is at 0 EV.
+    DisplayLinear,
+    /// Display-referred, sRGB-encoded (16-bit PNG/TIFF): linearised, shown as-is at 0 EV.
+    DisplaySrgb,
+}
+
+/// Build GPU exposure data from high-precision pixels (scaled to at most `max_side`).
+fn high_precision(mut img: image::Rgba32FImage, max_side: u32, light: Light) -> Hdr {
+    use rayon::prelude::*;
+    let (w, h) = img.dimensions();
+    if w.max(h) > max_side {
+        let scale = max_side as f32 / w.max(h) as f32;
+        let (nw, nh) = (((w as f32 * scale) as u32).max(1), ((h as f32 * scale) as u32).max(1));
+        img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    }
+    let size = [img.width(), img.height()];
+    let mut pixels = img.into_raw();
+    if matches!(light, Light::DisplaySrgb) {
+        let linear = |c: f32| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+        pixels.par_chunks_mut(4).for_each(|p| {
+            for c in &mut p[..3] {
+                *c = linear(*c);
+            }
+        });
+    }
+    let (auto_exposure, tonemap) = match light {
+        Light::Scene => (auto_exposure(&pixels), true),
+        _ => (1.0, false),
+    };
+    Hdr { levels: hdr_mips(pixels, size), auto_exposure, tonemap }
 }
 
 /// Formats whose grid thumbnails should come from Explorer's cache before decoding ourselves
@@ -121,11 +193,13 @@ pub fn prefers_shell_thumbnail(path: &Path) -> bool {
     crate::wic::handles(path) || matches!(extension(path).as_str(), "tif" | "tiff" | "psd" | "exr" | "hdr")
 }
 
-fn from_wic(path: &Path, max_side: u32) -> Result<Decoded, String> {
-    let wic = crate::wic::decode(path, max_side)?;
+fn from_wic(path: &Path, max_side: u32, want_linear: bool) -> Result<Decoded, String> {
+    let wic = crate::wic::decode(path, max_side, want_linear)?;
     let image = apply_orientation(wic.image, wic.orientation);
     let opaque = is_opaque(&image);
-    Ok(Decoded { image, opaque, source_size: wic.source_size, frames: Vec::new(), hdr: None })
+    let hdr = wic.linear.map(|l| high_precision(apply_orientation(l, wic.orientation), max_side, Light::DisplayLinear));
+    let bit_depth = Some(BitDepth { bits: wic.bits, float: wic.float });
+    Ok(Decoded { image, opaque, source_size: wic.source_size, frames: Vec::new(), hdr, bit_depth })
 }
 
 /// `image::load_from_memory` without the default 512 MB allocation cap: big images are
@@ -234,8 +308,11 @@ pub struct HdrLevel {
 pub struct Hdr {
     /// Full mip chain, largest first.
     pub levels: Vec<HdrLevel>,
-    /// Exposure multiplier that maps the scene's log-average luminance to middle grey.
+    /// Exposure multiplier at 0 EV (maps a scene's log-average luminance to middle grey; 1 for
+    /// display-referred images).
     pub auto_exposure: f32,
+    /// Tone-map highlights with ACES (scene-referred); otherwise clip (display-referred).
+    pub tonemap: bool,
 }
 
 fn auto_exposure(pixels: &[f32]) -> f32 {
@@ -317,17 +394,19 @@ fn decode_hdr(bytes: &[u8], max_side: u32, keep_linear: bool) -> Result<Decoded,
     let pixels = img.into_raw();
     let exposure = auto_exposure(&pixels);
     let image = tonemap(&pixels, size, exposure);
-    let hdr = keep_linear.then(|| Hdr { levels: hdr_mips(pixels, size), auto_exposure: exposure });
+    let hdr = keep_linear.then(|| Hdr { levels: hdr_mips(pixels, size), auto_exposure: exposure, tonemap: true });
     let opaque = is_opaque(&image);
-    Ok(Decoded { hdr, source_size: [w, h], ..Decoded::still(image, opaque) })
+    let bit_depth = Some(BitDepth { bits: 32, float: true });
+    Ok(Decoded { hdr, bit_depth, source_size: [w, h], ..Decoded::still(image, opaque) })
 }
 
 /// Photoshop files carry a flattened composite of all layers; show that.
 fn decode_psd(bytes: &[u8]) -> Result<Decoded, String> {
     let psd = psd::Psd::from_bytes(bytes).map_err(|e| e.to_string())?;
+    let bits = psd.depth() as u8;
     let image = RgbaImage::from_raw(psd.width(), psd.height(), psd.rgba()).ok_or("PSD buffer size mismatch")?;
     let opaque = is_opaque(&image);
-    Ok(Decoded::still(image, opaque))
+    Ok(Decoded { bit_depth: Some(BitDepth { bits, float: bits == 32 }), ..Decoded::still(image, opaque) })
 }
 
 fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
@@ -342,7 +421,7 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     let orientation = decoder.exif().and_then(|e| exif_orientation(e)).unwrap_or(1);
     let image = RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)
         .ok_or("jpeg buffer size mismatch")?;
-    Ok(Decoded::still(apply_orientation(image, orientation), true))
+    Ok(Decoded { bit_depth: Some(BitDepth::EIGHT), ..Decoded::still(apply_orientation(image, orientation), true) })
 }
 
 /// Downscale (area-averaging) so that neither side exceeds `max_side`.
@@ -357,7 +436,10 @@ pub fn fit_within(image: RgbaImage, max_side: u32) -> RgbaImage {
     image::imageops::thumbnail(&image, nw, nh)
 }
 
-fn apply_orientation(img: RgbaImage, orientation: u16) -> RgbaImage {
+fn apply_orientation<P: image::Pixel + 'static>(
+    img: image::ImageBuffer<P, Vec<P::Subpixel>>,
+    orientation: u16,
+) -> image::ImageBuffer<P, Vec<P::Subpixel>> {
     use image::imageops::*;
     match orientation {
         2 => flip_horizontal(&img),

@@ -25,11 +25,17 @@ pub struct WicImage {
     pub source_size: [u32; 2],
     /// EXIF orientation (1–8) still to be applied to `image`.
     pub orientation: u16,
+    /// Source bits per channel, and whether they are floating point.
+    pub bits: u8,
+    pub float: bool,
+    /// Linear-light copy (scRGB) for sources deeper than 8 bits, when requested.
+    pub linear: Option<image::Rgba32FImage>,
 }
 
-/// Decode `path`, scaled so its longest side is at most `max_side`.
-pub fn decode(path: &Path, max_side: u32) -> Result<WicImage, String> {
-    imp::decode(path, max_side).map_err(|e| format!("WIC: {e}"))
+/// Decode `path`, scaled so its longest side is at most `max_side`. With `want_linear`, sources
+/// deeper than 8 bits per channel also return a high-precision linear copy.
+pub fn decode(path: &Path, max_side: u32, want_linear: bool) -> Result<WicImage, String> {
+    imp::decode(path, max_side, want_linear).map_err(|e| format!("WIC: {e}"))
 }
 
 #[cfg(windows)]
@@ -65,7 +71,18 @@ mod imp {
         }
     }
 
-    pub fn decode(path: &Path, max_side: u32) -> windows::core::Result<WicImage> {
+    /// Bits per channel and float-ness of a WIC pixel format.
+    fn depth(factory: &IWICImagingFactory, format: &windows::core::GUID) -> Option<(u8, bool)> {
+        unsafe {
+            let info: IWICPixelFormatInfo2 = factory.CreateComponentInfo(format).ok()?.cast().ok()?;
+            let bpp = info.GetBitsPerPixel().ok()?;
+            let channels = info.GetChannelCount().ok()?.max(1);
+            let float = info.GetNumericRepresentation().is_ok_and(|r| r == WICPixelFormatNumericRepresentationFloat);
+            Some(((bpp / channels) as u8, float))
+        }
+    }
+
+    pub fn decode(path: &Path, max_side: u32, want_linear: bool) -> windows::core::Result<WicImage> {
         FACTORY.with(|factory| {
             let factory = factory.as_ref().ok_or_else(windows::core::Error::empty)?;
             unsafe {
@@ -79,6 +96,7 @@ mod imp {
                 let (mut w, mut h) = (0u32, 0u32);
                 frame.GetSize(&mut w, &mut h)?;
                 let orientation = orientation(&frame).unwrap_or(1);
+                let (bits, float) = frame.GetPixelFormat().ok().and_then(|f| depth(factory, &f)).unwrap_or((8, false));
 
                 let mut source: IWICBitmapSource = frame.cast()?;
                 let (mut tw, mut th) = (w, h);
@@ -103,7 +121,25 @@ mod imp {
                 converter.CopyPixels(std::ptr::null(), tw * 4, &mut pixels)?;
                 let image = RgbaImage::from_raw(tw, th, pixels).ok_or_else(windows::core::Error::empty)?;
                 let source_size = if (5..=8).contains(&orientation) { [h, w] } else { [w, h] };
-                Ok(WicImage { image, source_size, orientation })
+                // Deep sources: also fetch half-float scRGB (linear) for exposure editing.
+                let linear = if want_linear && (bits > 8 || float) {
+                    let converter = factory.CreateFormatConverter()?;
+                    converter.Initialize(
+                        &source,
+                        &GUID_WICPixelFormat64bppRGBAHalf,
+                        WICBitmapDitherTypeNone,
+                        None,
+                        0.0,
+                        WICBitmapPaletteTypeCustom,
+                    )?;
+                    let mut halves = vec![0u16; tw as usize * th as usize * 4];
+                    converter.CopyPixels(std::ptr::null(), tw * 8, bytemuck::cast_slice_mut(&mut halves))?;
+                    let floats = halves.iter().map(|&h| half::f16::from_bits(h).to_f32()).collect();
+                    image::Rgba32FImage::from_raw(tw, th, floats)
+                } else {
+                    None
+                };
+                Ok(WicImage { image, source_size, orientation, bits, float, linear })
             }
         })
     }
@@ -115,7 +151,7 @@ mod imp {
 
     use super::WicImage;
 
-    pub fn decode(_path: &Path, _max_side: u32) -> Result<WicImage, String> {
+    pub fn decode(_path: &Path, _max_side: u32, _want_linear: bool) -> Result<WicImage, String> {
         Err("not available on this platform".into())
     }
 }
