@@ -382,6 +382,11 @@ pub struct CyclopsApp {
     children_loading: HashSet<PathBuf>,
     children_tx: Sender<(PathBuf, Vec<PathBuf>)>,
     children_rx: Receiver<(PathBuf, Vec<PathBuf>)>,
+    /// Whether tree folders have subfolders (for showing the expand chevron), probed in the
+    /// background so big folders never stall the UI.
+    has_subdirs: HashMap<PathBuf, bool>,
+    probe_tx: Sender<PathBuf>,
+    probe_rx: Receiver<(PathBuf, bool)>,
     /// Native shell icons for special folders, drives and network locations (None = pending/failed).
     icon_loader: IconLoader,
     shell_icons: HashMap<(PathBuf, u32), Option<TextureHandle>>,
@@ -484,6 +489,23 @@ impl CyclopsApp {
         let roots = fs::roots();
         let special = roots.iter().map(|(_, p)| p.clone()).collect();
         let (children_tx, children_rx) = unbounded();
+        let (probe_tx, probe_jobs) = unbounded::<PathBuf>();
+        let (probe_done, probe_rx) = unbounded();
+        {
+            let ctx = cc.egui_ctx.clone();
+            std::thread::Builder::new()
+                .name("cyclops-tree-probe".into())
+                .spawn(move || {
+                    for path in probe_jobs {
+                        let has = fs::has_subdirs(&path);
+                        if probe_done.send((path, has)).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                    }
+                })
+                .expect("spawn tree probe thread");
+        }
         let mut app = Self {
             loader: Loader::new(cc.egui_ctx.clone()),
             ctx: cc.egui_ctx.clone(),
@@ -494,6 +516,9 @@ impl CyclopsApp {
             children_loading: HashSet::new(),
             children_tx,
             children_rx,
+            has_subdirs: HashMap::new(),
+            probe_tx,
+            probe_rx,
             icon_loader: IconLoader::new(cc.egui_ctx.clone()),
             shell_icons: HashMap::new(),
             special,
@@ -778,6 +803,9 @@ impl CyclopsApp {
     // ------------------------------------------------------------------ loading
 
     fn receive(&mut self, ctx: &egui::Context) {
+        for (path, has) in self.probe_rx.try_iter() {
+            self.has_subdirs.insert(path, has);
+        }
         let arrived: Vec<_> = self.children_rx.try_iter().collect();
         for (path, kids) in arrived {
             self.children_loading.remove(&path);
@@ -1233,6 +1261,9 @@ impl CyclopsApp {
         let chevron = Rect::from_min_size(pos2(rect.min.x + indent, rect.min.y + 4.0), vec2(16.0, 16.0));
         let on_chevron = resp.interact_pointer_pos().is_some_and(|p| chevron.expand(3.0).contains(p));
         let shell_tex = self.shell_icon(path, (16.0 * ui.ctx().pixels_per_point()).ceil() as u32);
+        // Like Explorer: no chevron on folders without subfolders (unknown yet = none drawn).
+        let expandable = ui.is_rect_visible(rect).then(|| self.expandable(path)).flatten().unwrap_or(false)
+            || self.tree_children.get(path).is_some_and(|c| !c.is_empty());
 
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
@@ -1241,8 +1272,10 @@ impl CyclopsApp {
             } else if resp.hovered() {
                 painter.rect_filled(rect, CornerRadius::same(6), theme::p().surface_hover);
             }
-            let chevron_icon = if expanded { Icon::ChevronDown } else { Icon::ChevronRight };
-            icons::paint(painter, chevron.shrink(2.0), chevron_icon, theme::p().text_dim);
+            if expandable {
+                let chevron_icon = if expanded { Icon::ChevronDown } else { Icon::ChevronRight };
+                icons::paint(painter, chevron.shrink(2.0), chevron_icon, theme::p().text_dim);
+            }
             let icon_rect = Rect::from_min_size(pos2(chevron.max.x + 4.0, rect.min.y + 4.0), vec2(16.0, 16.0));
             if let Some(tex) = shell_tex {
                 painter.image(tex, icon_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
@@ -1256,7 +1289,7 @@ impl CyclopsApp {
             painter.with_clip_rect(rect).galley(text_pos, galley, color);
         }
 
-        if resp.clicked() && on_chevron || resp.double_clicked() {
+        if expandable && (resp.clicked() && on_chevron || resp.double_clicked()) {
             if expanded {
                 self.expanded.remove(&key);
             } else {
@@ -1304,6 +1337,24 @@ impl CyclopsApp {
                 }
             }
         }
+    }
+
+    /// Whether a tree folder can expand: `None` while still being probed.
+    fn expandable(&mut self, path: &Path) -> Option<bool> {
+        if let Some(children) = self.tree_children.get(path) {
+            return Some(!children.is_empty());
+        }
+        // Never probe the network just to draw a chevron.
+        if fs::is_remote(path) {
+            return Some(true);
+        }
+        if let Some(&has) = self.has_subdirs.get(path) {
+            return Some(has);
+        }
+        self.has_subdirs.insert(path.to_path_buf(), false);
+        let _ = self.probe_tx.send(path.to_path_buf());
+        // Placeholder until the probe answers (cached as false above, overwritten by the result).
+        None
     }
 
     fn grid_keyboard(&mut self, ctx: &egui::Context) {
@@ -2487,6 +2538,7 @@ impl CyclopsApp {
         self.full_lru.retain(|p| p != path);
         if let Some(parent) = path.parent() {
             self.tree_children.remove(parent);
+            self.has_subdirs.remove(parent);
         }
     }
 
@@ -2532,6 +2584,7 @@ impl CyclopsApp {
     /// Show a just-created folder (in the grid and tree) and open the rename box for it.
     fn folder_created(&mut self, parent: &Path, path: PathBuf) {
         self.tree_children.remove(parent);
+        self.has_subdirs.remove(parent);
         if let Some(root) = self.tree_root.clone() {
             self.expanded.insert((root, parent.to_path_buf()));
         }

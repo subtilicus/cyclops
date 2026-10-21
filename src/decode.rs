@@ -386,6 +386,10 @@ fn hdr_mips(pixels: Vec<f32>, size: [u32; 2]) -> Vec<HdrLevel> {
 fn decode_hdr(bytes: &[u8], max_side: u32, keep_linear: bool) -> Result<Decoded, String> {
     let mut img = load_unlimited(bytes)?.into_rgba32f();
     let (w, h) = img.dimensions();
+    // Measure exposure on the full-resolution data, before any downscaling: shrinking averages
+    // highlights into their surroundings and would give thumbnails a different (darker) exposure
+    // than the full-size view.
+    let exposure = auto_exposure(img.as_raw());
     if w.max(h) > max_side {
         let scale = max_side as f32 / w.max(h) as f32;
         let (nw, nh) = (((w as f32 * scale) as u32).max(1), ((h as f32 * scale) as u32).max(1));
@@ -393,7 +397,6 @@ fn decode_hdr(bytes: &[u8], max_side: u32, keep_linear: bool) -> Result<Decoded,
     }
     let size = [img.width(), img.height()];
     let pixels = img.into_raw();
-    let exposure = auto_exposure(&pixels);
     let image = tonemap(&pixels, size, exposure);
     let hdr = keep_linear.then(|| Hdr { levels: hdr_mips(pixels, size), auto_exposure: exposure, tonemap: true });
     let opaque = is_opaque(&image);

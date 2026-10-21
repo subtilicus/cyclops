@@ -183,6 +183,14 @@ pub fn subdirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Whether `dir` has at least one visible subfolder (stops at the first one found).
+pub fn has_subdirs(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    rd.flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .any(|e| !is_hidden(&e.path(), &e.file_name().to_string_lossy()))
+}
+
 /// Folders first, then images, each naturally sorted.
 pub fn list(dir: &Path) -> std::io::Result<Vec<Entry>> {
     let mut entries: Vec<Entry> = std::fs::read_dir(dir)?
