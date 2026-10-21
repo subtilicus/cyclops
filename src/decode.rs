@@ -93,12 +93,26 @@ pub struct Decoded {
     pub bit_depth: Option<BitDepth>,
     /// Storage format worth showing (e.g. "BC7" for GPU textures).
     pub format: Option<String>,
+    /// GPU textures: [levels, layers, faces], and the other sub-images (mips, layers, faces).
+    /// The image above is sub-image `[0, 0, 0]`.
+    pub sub_layout: Option<[u32; 3]>,
+    pub subimages: Vec<([u32; 3], Decoded)>,
 }
 
 impl Decoded {
     fn still(image: RgbaImage, opaque: bool) -> Self {
         let source_size = [image.width(), image.height()];
-        Self { image, opaque, source_size, frames: Vec::new(), hdr: None, bit_depth: None, format: None }
+        Self {
+            image,
+            opaque,
+            source_size,
+            frames: Vec::new(),
+            hdr: None,
+            bit_depth: None,
+            format: None,
+            sub_layout: None,
+            subimages: Vec::new(),
+        }
     }
 }
 
@@ -135,8 +149,7 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
     if animate {
         if let Some(frames) = decode_animation(&bytes, &ext) {
             let image = frames[0].0.clone();
-            let source_size = [image.width(), image.height()];
-            return Ok(Decoded { image, opaque: false, source_size, frames, hdr: None, bit_depth: Some(BitDepth::EIGHT), format: None });
+            return Ok(Decoded { frames, opaque: false, bit_depth: Some(BitDepth::EIGHT), ..Decoded::still(image, false) });
         }
     }
     let img = match load_unlimited(&bytes) {
@@ -203,7 +216,7 @@ fn from_wic(path: &Path, max_side: u32, want_linear: bool) -> Result<Decoded, St
     let opaque = is_opaque(&image);
     let hdr = wic.linear.map(|l| high_precision(apply_orientation(l, wic.orientation), max_side, Light::DisplayLinear));
     let bit_depth = Some(BitDepth { bits: wic.bits, float: wic.float });
-    Ok(Decoded { image, opaque, source_size: wic.source_size, frames: Vec::new(), hdr, bit_depth, format: None })
+    Ok(Decoded { source_size: wic.source_size, hdr, bit_depth, ..Decoded::still(image, opaque) })
 }
 
 /// `image::load_from_memory` without the default 512 MB allocation cap: big images are
@@ -386,14 +399,24 @@ fn hdr_mips(pixels: Vec<f32>, size: [u32; 2]) -> Vec<HdrLevel> {
 /// Radiance HDR and OpenEXR hold linear scene light. Returns a CPU tone-mapped image (for
 /// thumbnails and as a fallback) plus, with `keep_linear`, the data for GPU tone mapping,
 /// scaled to at most `max_side`.
-/// DDS / KTX / KTX2 GPU textures (mip 0 of the first layer/face).
-fn decode_texture(bytes: &[u8], ext: &str, max_side: u32, keep_linear: bool) -> Result<Decoded, String> {
-    use crate::gputex::{self, Pixels};
-    let texture = match ext {
-        "dds" => gputex::decode_dds(bytes),
-        "ktx2" => gputex::decode_ktx2(bytes),
-        _ => gputex::decode_ktx1(bytes),
-    }?;
+/// DDS / KTX / KTX2 GPU textures. Full-size requests decode every mip level, array layer and
+/// cube face so the viewer can step through them; thumbnails only the first.
+fn decode_texture(bytes: &[u8], ext: &str, max_side: u32, full: bool) -> Result<Decoded, String> {
+    let set = crate::gputex::decode_container(bytes, ext, !full)?;
+    let mut subs = set.subs.into_iter();
+    let first = subs.next().ok_or("texture has no image data")?;
+    let mut decoded = texture_image(first.texture, max_side, full)?;
+    if full && (set.levels > 1 || set.layers > 1 || set.faces > 1) {
+        decoded.sub_layout = Some([set.levels, set.layers, set.faces]);
+        for sub in subs {
+            decoded.subimages.push(([sub.level, sub.layer, sub.face], texture_image(sub.texture, max_side, full)?));
+        }
+    }
+    Ok(decoded)
+}
+
+fn texture_image(texture: crate::gputex::Texture, max_side: u32, keep_linear: bool) -> Result<Decoded, String> {
+    use crate::gputex::Pixels;
     let format = Some(texture.format);
     match texture.pixels {
         Pixels::Ldr(image) => {

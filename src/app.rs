@@ -125,6 +125,42 @@ struct FullImage {
     bit_depth: Option<crate::decode::BitDepth>,
     /// Storage format worth showing (e.g. "BC7" for GPU textures).
     format: Option<String>,
+    /// GPU textures: [levels, layers, faces], every sub-image, and which one is shown.
+    sub_layout: Option<[u32; 3]>,
+    subs: Vec<SubTex>,
+    sub_current: usize,
+}
+
+/// One mip level / layer / face of a GPU texture, ready to display.
+struct SubTex {
+    coords: [u32; 3],
+    main: TextureHandle,
+    /// HDR data of this sub-image while it is *not* shown (the shown one lives in `FullImage`).
+    hdr: Option<HdrEdit>,
+    size: Vec2,
+}
+
+const CUBE_FACES: [&str; 6] = ["+X", "−X", "+Y", "−Y", "+Z", "−Z"];
+
+impl FullImage {
+    /// Show sub-image `index` (swapping the current one's HDR data back into its slot).
+    fn select_sub(&mut self, index: usize) {
+        if index == self.sub_current || index >= self.subs.len() {
+            return;
+        }
+        std::mem::swap(&mut self.hdr, &mut self.subs[self.sub_current].hdr);
+        std::mem::swap(&mut self.hdr, &mut self.subs[index].hdr);
+        let sub = &self.subs[index];
+        self.main = sub.main.clone();
+        self.source_size = sub.size;
+        self.screen = None;
+        self.sub_current = index;
+    }
+
+    /// Index of the sub-image at `coords`, if the texture has one.
+    fn find_sub(&self, coords: [u32; 3]) -> Option<usize> {
+        self.subs.iter().position(|s| s.coords == coords)
+    }
 }
 
 struct HdrEdit {
@@ -843,7 +879,9 @@ impl CyclopsApp {
                 Kind::Full => {
                     if let Some(slot) = self.full.get_mut(&loaded.path) {
                         *slot = match loaded.result {
-                            Ok(images) => Full::Ready(FullImage {
+                            Ok(images) => Full::Ready({
+                                let main_tex = ctx.load_texture(name.clone(), images.main, TextureOptions::LINEAR);
+                                FullImage {
                                 frames: images
                                     .frames
                                     .into_iter()
@@ -854,6 +892,29 @@ impl CyclopsApp {
                                     .collect(),
                                 bit_depth: images.bit_depth,
                                 format: images.format,
+                                sub_layout: images.sub_layout,
+                                sub_current: 0,
+                                subs: if images.sub_layout.is_some() {
+                                    let first = SubTex {
+                                        coords: [0, 0, 0],
+                                        main: main_tex.clone(),
+                                        hdr: None,
+                                        size: vec2(images.source_size[0] as f32, images.source_size[1] as f32),
+                                    };
+                                    std::iter::once(first)
+                                        .chain(images.subimages.into_iter().enumerate().map(|(i, sub)| SubTex {
+                                            coords: sub.coords,
+                                            main: ctx.load_texture(format!("{name}#sub{i}"), sub.main, TextureOptions::LINEAR),
+                                            hdr: sub.hdr.zip(self.render_state.as_ref()).and_then(|(hdr, rs)| {
+                                                let gpu = crate::hdr_gpu::upload(rs, &hdr.levels)?;
+                                                Some(HdrEdit { gpu, auto_exposure: hdr.auto_exposure, tonemap: hdr.tonemap, ev: 0.0 })
+                                            }),
+                                            size: vec2(sub.size[0] as f32, sub.size[1] as f32),
+                                        }))
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                },
                                 blur: images.blur.map(|b| ctx.load_texture(format!("{name}#blur"), b, TextureOptions::LINEAR)),
                                 ready_at: ctx.input(|i| i.time),
                                 paused_at: None,
@@ -861,12 +922,12 @@ impl CyclopsApp {
                                     let gpu = crate::hdr_gpu::upload(rs, &hdr.levels)?;
                                     Some(HdrEdit { gpu, auto_exposure: hdr.auto_exposure, tonemap: hdr.tonemap, ev: 0.0 })
                                 }),
-                                main: ctx.load_texture(name.clone(), images.main, TextureOptions::LINEAR),
+                                main: main_tex,
                                 screen: images
                                     .screen
                                     .map(|s| ctx.load_texture(name + "#screen", s, TextureOptions::LINEAR)),
                                 source_size: vec2(images.source_size[0] as f32, images.source_size[1] as f32),
-                            }),
+                            }}),
                             Err(e) => Full::Failed(e),
                         };
                     }
@@ -1716,6 +1777,26 @@ impl CyclopsApp {
         } else if edit {
             self.pending_action = Some(FileAction::Edit(index));
         }
+        // Ctrl+arrows step through a texture's mips (↑ smaller / ↓ larger) and layers/faces
+        // (← →): keyboard-layout independent, and plain arrows keep changing images.
+        let (mip_down, mip_up, slice_prev, slice_next) = ctx.input(|i| {
+            let ctrl = i.modifiers.ctrl;
+            (
+                ctrl && i.key_pressed(Key::ArrowDown),
+                ctrl && i.key_pressed(Key::ArrowUp),
+                ctrl && i.key_pressed(Key::ArrowLeft),
+                ctrl && i.key_pressed(Key::ArrowRight),
+            )
+        });
+        if let Some(path) = self.entries.get(index).map(|e| e.path.clone()) {
+            match (mip_down, mip_up, slice_prev, slice_next) {
+                (true, ..) => self.step_sub(&path, 0, -1),
+                (_, true, ..) => self.step_sub(&path, 0, 1),
+                (_, _, true, _) => self.step_sub(&path, 1, -1),
+                (.., true) => self.step_sub(&path, 1, 1),
+                _ => {}
+            }
+        }
         let is_video = self.entries.get(index).is_some_and(|e| e.is_video);
         let animated = self.entries.get(index).and_then(|e| match self.full.get(&e.path) {
             Some(Full::Ready(img)) if !img.frames.is_empty() => Some(e.path.clone()),
@@ -1740,11 +1821,12 @@ impl CyclopsApp {
         }
         let (next, prev, first, last, esc, fit, one, zoom_in, zoom_out) = ctx.input(|i| {
             (
-                i.key_pressed(Key::ArrowRight)
-                    || i.key_pressed(Key::ArrowDown)
+                (!i.modifiers.ctrl && (i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::ArrowDown)))
                     || (!plays && i.key_pressed(Key::Space))
                     || i.key_pressed(Key::PageDown),
-                i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowUp) || i.key_pressed(Key::Backspace) || i.key_pressed(Key::PageUp),
+                (!i.modifiers.ctrl && (i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowUp)))
+                    || i.key_pressed(Key::Backspace)
+                    || i.key_pressed(Key::PageUp),
                 i.key_pressed(Key::Home),
                 i.key_pressed(Key::End),
                 i.key_pressed(Key::Escape) || (!i.modifiers.alt && i.key_pressed(Key::Enter)),
@@ -1932,6 +2014,7 @@ impl CyclopsApp {
         }
         if !entry.is_video {
             self.exposure_control(ui, rect, &entry.path);
+            self.texture_controls(ui, rect, &entry.path);
         }
         // Overlay opacity: videos fade their controls (and the info pill) out when the mouse rests.
         let overlay_alpha = if entry.is_video {
@@ -2079,6 +2162,7 @@ impl CyclopsApp {
                 };
             }
             self.exposure_control(ui, img_rect, &entry.path);
+            self.texture_controls(ui, img_rect, &entry.path);
             self.animation_controls(ui, img_rect, &entry.path, 30.0);
             if let Some((size, ..)) = &full {
                 details.push(format!("{}×{}", size.x as u32, size.y as u32));
@@ -2702,6 +2786,75 @@ impl CyclopsApp {
         let pill = Rect::from_center_size(pos2(screen.center().x, screen.max.y - 120.0), galley.size() + vec2(32.0, 16.0));
         painter.rect(pill, CornerRadius::same(255), Color32::from_rgba_unmultiplied(150, 30, 30, 230), Stroke::NONE, egui::StrokeKind::Inside);
         painter.galley(pill.min + vec2(16.0, 8.0), galley, Color32::WHITE);
+    }
+
+    /// Step a GPU texture's mip level (`dim` 0) or layer/face slice (`dim` 1) by `delta`.
+    fn step_sub(&mut self, path: &Path, dim: usize, delta: i32) {
+        let Some(Full::Ready(img)) = self.full.get_mut(path) else { return };
+        let Some([levels, layers, faces]) = img.sub_layout else { return };
+        let [level, layer, face] = img.subs[img.sub_current].coords;
+        let target = if dim == 0 {
+            let level = (level as i32 + delta).clamp(0, levels as i32 - 1) as u32;
+            [level, layer, face]
+        } else {
+            // Layers and faces step together as one "slice" index, wrapping around.
+            let count = (layers * faces) as i32;
+            let slice = ((layer * faces + face) as i32 + delta).rem_euclid(count) as u32;
+            [level, slice / faces, slice % faces]
+        };
+        if let Some(i) = img.find_sub(target) {
+            img.select_sub(i);
+        }
+    }
+
+    /// Glass control for GPU textures with mips / layers / faces, in the top-left of `area`.
+    fn texture_controls(&mut self, ui: &mut egui::Ui, area: Rect, path: &Path) {
+        let (layout, coords, size) = match self.full.get(path) {
+            Some(Full::Ready(img)) if !img.subs.is_empty() => {
+                (img.sub_layout.unwrap_or([1, 1, 1]), img.subs[img.sub_current].coords, img.source_size)
+            }
+            _ => return,
+        };
+        let [levels, layers, faces] = layout;
+        let mut rows: Vec<(&str, String, usize)> = Vec::new();
+        if levels > 1 {
+            rows.push(("Mip", format!("{} / {}   {}×{}", coords[0], levels - 1, size.x as u32, size.y as u32), 0));
+        }
+        if layers > 1 {
+            rows.push(("Layer", format!("{} / {}", coords[1] + 1, layers), 1));
+        }
+        if faces == 6 {
+            rows.push(("Face", CUBE_FACES[coords[2] as usize % 6].to_owned(), 1));
+        }
+        if rows.is_empty() {
+            return;
+        }
+        let row_h = 30.0;
+        let panel = Rect::from_min_size(area.min + vec2(16.0, 16.0), vec2(250.0, rows.len() as f32 * row_h + 12.0));
+        let painter = ui.painter().clone();
+        crate::glass::paint(&painter, panel, 12.0, self.backdrop);
+        let fg = theme::DARK.text;
+        let mut step = None;
+        for (i, (label, value, dim)) in rows.iter().enumerate() {
+            let cy = panel.min.y + 6.0 + row_h * (i as f32 + 0.5);
+            painter.text(pos2(panel.min.x + 14.0, cy), Align2::LEFT_CENTER, *label, FontId::proportional(12.5), theme::DARK.text_dim);
+            painter.text(pos2(panel.min.x + 92.0, cy), Align2::LEFT_CENTER, value, FontId::monospace(12.0), fg);
+            for (dx, delta, icon) in [(-44.0, -1, Icon::ChevronLeft), (-18.0, 1, Icon::ChevronRight)] {
+                let r = Rect::from_center_size(pos2(panel.max.x + dx, cy), vec2(24.0, 24.0));
+                let resp = ui.interact(r, ui.scope_id().with(("texsub", i, delta)), Sense::click());
+                if resp.hovered() {
+                    painter.rect_filled(r, CornerRadius::same(6), Color32::from_white_alpha(24));
+                }
+                let color = if resp.hovered() { Color32::WHITE } else { fg };
+                icons::paint(&painter, r.shrink(5.0), icon, color);
+                if resp.clicked() {
+                    step = Some((*dim, delta));
+                }
+            }
+        }
+        if let Some((dim, delta)) = step {
+            self.step_sub(path, dim, delta);
+        }
     }
 
     /// Glass exposure slider for HDR/EXR images, at the top of `area`.

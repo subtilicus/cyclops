@@ -52,7 +52,18 @@ pub struct Images {
     pub bit_depth: Option<decode::BitDepth>,
     /// Storage format worth showing (e.g. "BC7").
     pub format: Option<String>,
+    /// GPU textures: [levels, layers, faces] and the other sub-images.
+    pub sub_layout: Option<[u32; 3]>,
+    pub subimages: Vec<SubImage>,
     pub decode_ms: f32,
+}
+
+/// One more mip level / array layer / cube face of a GPU texture.
+pub struct SubImage {
+    pub coords: [u32; 3],
+    pub main: ColorImage,
+    pub hdr: Option<decode::Hdr>,
+    pub size: [usize; 2],
 }
 
 pub struct Loader {
@@ -138,6 +149,8 @@ fn worker(
                     blur: None,
                     bit_depth: None,
                     format: None,
+                    sub_layout: None,
+                    subimages: Vec::new(),
                     decode_ms: start.elapsed().as_secs_f32() * 1000.0,
                 })
                 .ok_or_else(|| "no thumbnail".to_owned());
@@ -150,7 +163,7 @@ fn worker(
         // RAW/HEIC thumbnails: Explorer's cached thumbnail is far faster than a full decode.
         if job.kind == Kind::Thumb && decode::prefers_shell_thumbnail(&job.path) {
             if let Some(main) = crate::shell::thumbnail_only(&job.path, job.max_side) {
-                let images = Images { source_size: main.size, main, screen: None, frames: Vec::new(), hdr: None, blur: None, bit_depth: None, format: None, decode_ms: 0.0 };
+                let images = Images { source_size: main.size, main, screen: None, frames: Vec::new(), hdr: None, blur: None, bit_depth: None, format: None, sub_layout: None, subimages: Vec::new(), decode_ms: 0.0 };
                 if done_tx.send(Loaded { path: job.path, kind: job.kind, result: Ok(images) }).is_err() {
                     return;
                 }
@@ -181,7 +194,18 @@ fn worker(
             let hdr = if full { d.hdr } else { None };
             let bit_depth = d.bit_depth;
             let format = d.format;
-            Images { main, screen, source_size, frames, hdr, blur, bit_depth, format, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
+            let sub_layout = d.sub_layout;
+            let subimages = d
+                .subimages
+                .into_iter()
+                .map(|(coords, sub)| SubImage {
+                    coords,
+                    size: [sub.image.width() as usize, sub.image.height() as usize],
+                    main: to_color_image(decode::fit_within(sub.image, job.max_side), sub.opaque),
+                    hdr: sub.hdr,
+                })
+                .collect();
+            Images { main, screen, source_size, frames, hdr, blur, bit_depth, format, sub_layout, subimages, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
         });
         crate::perflog::record(|| match &result {
             Ok(img) => format!(

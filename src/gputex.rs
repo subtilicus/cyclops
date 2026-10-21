@@ -174,12 +174,65 @@ fn decode_bc6h(data: &[u8], w: u32, h: u32, signed: bool) -> Result<Rgba32FImage
     Rgba32FImage::from_raw(w, h, out).ok_or_else(|| "texture size mismatch".to_owned())
 }
 
+// ---------------------------------------------------------------- sub-images
+
+/// One sub-image of a texture: a mip level of one array layer and cube face.
+pub struct SubTexture {
+    pub level: u32,
+    pub layer: u32,
+    pub face: u32,
+    pub texture: Texture,
+}
+
+/// The sub-images of a texture (all of them, or just the first), plus its extent in each
+/// direction so the viewer can step through levels, layers and faces.
+pub struct TextureSet {
+    pub subs: Vec<SubTexture>,
+    pub levels: u32,
+    pub layers: u32,
+    pub faces: u32,
+}
+
+impl Fmt {
+    /// Block footprint and bytes per block (uncompressed: 1×1 and bytes per pixel).
+    fn block(self) -> (usize, usize, usize) {
+        match self {
+            Fmt::Bc1 | Fmt::Bc1a | Fmt::Bc4 | Fmt::Etc1 | Fmt::Etc2Rgb | Fmt::Etc2Rgba1 | Fmt::EacR => (4, 4, 8),
+            Fmt::Bc2 | Fmt::Bc3 | Fmt::Bc5 | Fmt::Bc6h { .. } | Fmt::Bc7 | Fmt::Etc2Rgba8 | Fmt::EacRg => (4, 4, 16),
+            Fmt::Astc(w, h) => (w as usize, h as usize, 16),
+            Fmt::Rgba8 | Fmt::Bgra8 | Fmt::Bgrx8 => (1, 1, 4),
+            Fmt::Rgb8 | Fmt::Bgr8 => (1, 1, 3),
+            Fmt::R8 => (1, 1, 1),
+            Fmt::Rg8 | Fmt::La8 => (1, 1, 2),
+            Fmt::Rgba16f => (1, 1, 8),
+            Fmt::Rgba32f => (1, 1, 16),
+        }
+    }
+
+    fn image_bytes(self, w: u32, h: u32) -> usize {
+        let (bw, bh, bytes) = self.block();
+        (w as usize).div_ceil(bw) * (h as usize).div_ceil(bh) * bytes
+    }
+}
+
+fn mip(size: u32, level: u32) -> u32 {
+    (size >> level).max(1)
+}
+
+/// Decode a DDS / KTX / KTX2 file (`ext`); with `first_only`, just mip 0 of the first layer/face.
+pub fn decode_container(bytes: &[u8], ext: &str, first_only: bool) -> Result<TextureSet, String> {
+    match ext {
+        "dds" => dds_set(bytes, first_only),
+        "ktx2" => ktx2_set(bytes, first_only),
+        _ => ktx1_set(bytes, first_only),
+    }
+}
+
 // ---------------------------------------------------------------- DDS
 
-pub fn decode_dds(bytes: &[u8]) -> Result<Texture, String> {
-    use ddsfile::{D3DFormat, Dds, DxgiFormat as D};
-    let dds = Dds::read(std::io::Cursor::new(bytes)).map_err(|e| format!("DDS: {e}"))?;
-    let fmt = if let Some(f) = dds.get_dxgi_format() {
+fn dds_format(dds: &ddsfile::Dds) -> Result<Fmt, String> {
+    use ddsfile::{D3DFormat, DxgiFormat as D};
+    Ok(if let Some(f) = dds.get_dxgi_format() {
         match f {
             D::BC1_Typeless | D::BC1_UNorm | D::BC1_UNorm_sRGB => Fmt::Bc1a,
             D::BC2_Typeless | D::BC2_UNorm | D::BC2_UNorm_sRGB => Fmt::Bc2,
@@ -211,9 +264,35 @@ pub fn decode_dds(bytes: &[u8]) -> Result<Texture, String> {
             Some(other) => return Err(format!("DDS format {other:?} isn't supported yet")),
             None => return Err("unknown DDS pixel format".into()),
         }
-    };
-    let data = dds.get_data(0).map_err(|e| format!("DDS: {e}"))?;
-    decode(fmt, data, dds.get_width(), dds.get_height())
+    })
+}
+
+fn dds_set(bytes: &[u8], first_only: bool) -> Result<TextureSet, String> {
+    let dds = ddsfile::Dds::read(std::io::Cursor::new(bytes)).map_err(|e| format!("DDS: {e}"))?;
+    let fmt = dds_format(&dds)?;
+    let (w0, h0) = (dds.get_width(), dds.get_height());
+    let levels = dds.get_num_mipmap_levels().max(1);
+    // ddsfile counts each cube face as an array layer (layers × 6).
+    let slices = dds.get_num_array_layers().max(1);
+    let cube = dds.header.caps2.contains(ddsfile::Caps2::CUBEMAP)
+        || dds.header10.as_ref().is_some_and(|h| h.misc_flag.contains(ddsfile::MiscFlag::TEXTURECUBE));
+    let faces = if cube && slices % 6 == 0 { 6 } else { 1 };
+    let mut subs = Vec::new();
+    'slices: for slice in 0..slices {
+        let data = dds.get_data(slice).map_err(|e| format!("DDS: {e}"))?;
+        let mut offset = 0;
+        for level in 0..levels {
+            let (w, h) = (mip(w0, level), mip(h0, level));
+            let size = fmt.image_bytes(w, h);
+            let Some(chunk) = data.get(offset..offset + size) else { break };
+            subs.push(SubTexture { level, layer: slice / faces, face: slice % faces, texture: decode(fmt, chunk, w, h)? });
+            offset += size;
+            if first_only {
+                break 'slices;
+            }
+        }
+    }
+    Ok(TextureSet { subs, levels, layers: slices / faces, faces })
 }
 
 // ---------------------------------------------------------------- KTX2
@@ -250,30 +329,49 @@ fn vk_format(v: u32) -> Option<Fmt> {
     })
 }
 
-pub fn decode_ktx2(bytes: &[u8]) -> Result<Texture, String> {
+fn ktx2_set(bytes: &[u8], first_only: bool) -> Result<TextureSet, String> {
     use ktx2::SupercompressionScheme as S;
     let reader = ktx2::Reader::new(bytes).map_err(|e| format!("KTX2: {e:?}"))?;
     let header = reader.header();
-    let Some(format) = header.format else {
-        return Err("Basis Universal (ETC1S/UASTC) KTX2 textures aren't supported yet".into());
-    };
+    if header.format.is_none() || header.supercompression_scheme == Some(S::BasisLZ) {
+        return crate::basis::decode_ktx2(bytes, first_only);
+    }
+    let format = header.format.expect("checked above");
     let fmt = vk_format(format.value()).ok_or_else(|| format!("KTX2 format {format:?} isn't supported yet"))?;
-    let level = reader.levels().next().ok_or("KTX2 file has no image data")?;
-    let data: std::borrow::Cow<[u8]> = match header.supercompression_scheme {
-        None => level.data.into(),
-        Some(S::Zstandard) => {
-            use std::io::Read;
-            let mut out = Vec::with_capacity(level.uncompressed_byte_length as usize);
-            ruzstd::decoding::StreamingDecoder::new(level.data)
-                .map_err(|e| format!("KTX2 zstd: {e}"))?
-                .read_to_end(&mut out)
-                .map_err(|e| format!("KTX2 zstd: {e}"))?;
-            out.into()
+    let (w0, h0) = (header.pixel_width, header.pixel_height.max(1));
+    let (layers, faces, depth) = (header.layer_count.max(1), header.face_count.max(1), header.pixel_depth.max(1));
+    let mut subs = Vec::new();
+    for (level, lvl) in reader.levels().enumerate() {
+        let level = level as u32;
+        let data: std::borrow::Cow<[u8]> = match header.supercompression_scheme {
+            None => lvl.data.into(),
+            Some(S::Zstandard) => {
+                use std::io::Read;
+                let mut out = Vec::with_capacity(lvl.uncompressed_byte_length as usize);
+                ruzstd::decoding::StreamingDecoder::new(lvl.data)
+                    .map_err(|e| format!("KTX2 zstd: {e}"))?
+                    .read_to_end(&mut out)
+                    .map_err(|e| format!("KTX2 zstd: {e}"))?;
+                out.into()
+            }
+            Some(other) => return Err(format!("KTX2 supercompression {other:?} isn't supported yet")),
+        };
+        let (w, h) = (mip(w0, level), mip(h0, level));
+        let size = fmt.image_bytes(w, h);
+        // Level data is laid out layer → face → z-slice; show z = 0 of 3D textures.
+        let slices = mip(depth, level) as usize;
+        for layer in 0..layers {
+            for face in 0..faces {
+                let offset = ((layer * faces + face) as usize) * slices * size;
+                let Some(chunk) = data.get(offset..offset + size) else { continue };
+                subs.push(SubTexture { level, layer, face, texture: decode(fmt, chunk, w, h)? });
+                if first_only {
+                    return Ok(TextureSet { subs, levels: header.level_count.max(1), layers, faces });
+                }
+            }
         }
-        Some(S::BasisLZ) => return Err("Basis Universal (ETC1S) KTX2 textures aren't supported yet".into()),
-        Some(other) => return Err(format!("KTX2 supercompression {other:?} isn't supported yet")),
-    };
-    decode(fmt, &data, header.pixel_width, header.pixel_height.max(1))
+    }
+    Ok(TextureSet { subs, levels: header.level_count.max(1), layers, faces })
 }
 
 // ---------------------------------------------------------------- KTX (version 1)
@@ -318,24 +416,55 @@ fn gl_format(internal: u32, format: u32, ty: u32) -> Option<Fmt> {
     })
 }
 
-pub fn decode_ktx1(bytes: &[u8]) -> Result<Texture, String> {
+fn ktx1_set(bytes: &[u8], first_only: bool) -> Result<TextureSet, String> {
     const MAGIC: [u8; 12] = [0xAB, b'K', b'T', b'X', b' ', b'1', b'1', 0xBB, b'\r', b'\n', 0x1A, b'\n'];
     if bytes.len() < 64 || bytes[..12] != MAGIC {
         return Err("not a KTX file".into());
     }
     let le = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) == 0x0403_0201;
-    let word = |i: usize| -> u32 {
-        let b: [u8; 4] = bytes[12 + i * 4..16 + i * 4].try_into().unwrap();
-        if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) }
+    let read_u32 = |at: usize| -> Option<u32> {
+        let b: [u8; 4] = bytes.get(at..at + 4)?.try_into().ok()?;
+        Some(if le { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
     };
+    let word = |i: usize| read_u32(12 + i * 4).unwrap_or(0);
     let (gl_type, gl_format_, gl_internal) = (word(1), word(3), word(4));
-    let (width, height) = (word(6), word(7).max(1));
-    let kv_bytes = word(12) as usize;
+    let (w0, h0, depth) = (word(6), word(7).max(1), word(8).max(1));
+    let (array, faces, levels, kv_bytes) = (word(9), word(10).max(1), word(11).max(1), word(12) as usize);
     let fmt = gl_format(gl_internal, gl_format_, gl_type)
         .ok_or_else(|| format!("KTX format 0x{gl_internal:04X} isn't supported yet"))?;
-    let start = 64 + kv_bytes;
-    let size_bytes: [u8; 4] = bytes.get(start..start + 4).ok_or("KTX file is truncated")?.try_into().unwrap();
-    let size = if le { u32::from_le_bytes(size_bytes) } else { u32::from_be_bytes(size_bytes) } as usize;
-    let data = bytes.get(start + 4..start + 4 + size).ok_or("KTX file is truncated")?;
-    decode(fmt, data, width, height)
+    let layers = array.max(1);
+    let align4 = |n: usize| (n + 3) & !3;
+    let mut offset = 64 + kv_bytes;
+    let mut subs = Vec::new();
+    for level in 0..levels {
+        let image_size = read_u32(offset).ok_or("KTX file is truncated")? as usize;
+        offset += 4;
+        let (w, h) = (mip(w0, level), mip(h0, level));
+        let size = fmt.image_bytes(w, h);
+        if faces == 6 && array == 0 {
+            // Non-array cubemaps: imageSize is one face, each face padded to 4 bytes.
+            for face in 0..6 {
+                let chunk = bytes.get(offset..offset + size).ok_or("KTX file is truncated")?;
+                subs.push(SubTexture { level, layer: 0, face, texture: decode(fmt, chunk, w, h)? });
+                offset = align4(offset + image_size);
+                if first_only {
+                    return Ok(TextureSet { subs, levels, layers, faces });
+                }
+            }
+        } else {
+            let slices = mip(depth, level) as usize;
+            for layer in 0..layers {
+                for face in 0..faces {
+                    let at = offset + ((layer * faces + face) as usize) * slices * size;
+                    let chunk = bytes.get(at..at + size).ok_or("KTX file is truncated")?;
+                    subs.push(SubTexture { level, layer, face, texture: decode(fmt, chunk, w, h)? });
+                    if first_only {
+                        return Ok(TextureSet { subs, levels, layers, faces });
+                    }
+                }
+            }
+            offset = align4(offset + image_size);
+        }
+    }
+    Ok(TextureSet { subs, levels, layers, faces })
 }

@@ -11,6 +11,7 @@ pub enum Icon {
     Down,
     Refresh,
     ChevronRight,
+    ChevronLeft,
     ChevronDown,
     Folder,
     Drive,
@@ -67,6 +68,7 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(&[end - tangent * 3.0 * s + normal * 2.0 * s, end, end - tangent * 3.0 * s - normal * 2.0 * s]);
         }
         Icon::ChevronRight => line(&[p(6.0, 4.0), p(10.0, 8.0), p(6.0, 12.0)]),
+        Icon::ChevronLeft => line(&[p(10.0, 4.0), p(6.0, 8.0), p(10.0, 12.0)]),
         Icon::ChevronDown => line(&[p(4.0, 6.0), p(8.0, 10.0), p(12.0, 6.0)]),
         Icon::Folder => {
             let tab = vec![p(1.5, 4.0), p(1.5, 3.0), p(6.0, 3.0), p(7.5, 4.5), p(14.5, 4.5), p(14.5, 13.0), p(1.5, 13.0)];
