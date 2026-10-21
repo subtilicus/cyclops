@@ -1071,7 +1071,11 @@ impl CyclopsApp {
                 // Content
                 egui::Frame::NONE.inner_margin(egui::Margin { left: 28, right: 20, top: 16, bottom: 20 }).show(ui, |ui| {
                     ui.vertical(|ui| {
+                        // Fixed size for every section, so the window never resizes (and re-centres)
+                        // when switching between them.
                         ui.set_width(560.0);
+                        ui.set_max_width(560.0);
+                        ui.set_height(height - 36.0);
                         ui.spacing_mut().item_spacing = vec2(8.0, 6.0);
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(page.label()).size(20.0).color(p.text_strong));
@@ -1216,11 +1220,12 @@ impl CyclopsApp {
             toggle(ui, &mut self.settings.perf_log);
         });
         if self.settings.perf_log {
+            // Button first so the (truncated) path can take the remaining width.
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(crate::perflog::path().display().to_string()).small().color(theme::p().text_dim));
                 if ui.small_button("Show in Explorer").clicked() {
                     ops::reveal(&crate::perflog::path());
                 }
+                ui.add(egui::Label::new(egui::RichText::new(crate::perflog::path().display().to_string()).small().color(theme::p().text_dim)).truncate());
             });
         }
     }
