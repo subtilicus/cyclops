@@ -693,12 +693,9 @@ impl CyclopsApp {
         None
     }
 
+    /// Windows' own icon for a folder, drive or network location (special folders, custom
+    /// folder icons and plain folders alike), so every folder matches Explorer.
     fn shell_icon(&mut self, path: &Path, px: u32) -> Option<egui::TextureId> {
-        let wanted = self.special.contains(path)
-            || matches!(fs::location(path), fs::Location::Network | fs::Location::Server | fs::Location::ShareRoot);
-        if !wanted {
-            return None;
-        }
         self.file_icon(path, px)
     }
 
@@ -899,6 +896,12 @@ impl CyclopsApp {
     }
 
     fn evict_thumbs(&mut self) {
+        // Folder icons accumulate while browsing; past a few thousand, keep only the sidebar's
+        // special folders (the rest reload on demand from the background icon thread).
+        if self.shell_icons.len() > 4000 {
+            let special = &self.special;
+            self.shell_icons.retain(|(path, _), _| special.contains(path));
+        }
         let live = self.thumbs.values().filter(|t| matches!(t, Thumb::Ready { .. })).count();
         if live <= MAX_LIVE_THUMBS {
             return;
