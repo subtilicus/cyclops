@@ -14,7 +14,7 @@ use zune_jpeg::JpegDecoder;
 
 pub const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "bmp", "webp", "tif", "tiff", "ico", "tga", "dds", "hdr",
-    "exr", "qoi", "pbm", "pgm", "ppm", "pnm", "pam", "svg", "svgz", "psd",
+    "exr", "qoi", "pbm", "pgm", "ppm", "pnm", "pam", "svg", "svgz", "psd", "ktx", "ktx2",
 ];
 
 pub const VIDEO_EXTENSIONS: &[&str] = &[
@@ -91,12 +91,14 @@ pub struct Decoded {
     /// High-precision linear data (HDR/EXR, 16-bit, deep WIC formats), for exposure changes.
     pub hdr: Option<Hdr>,
     pub bit_depth: Option<BitDepth>,
+    /// Storage format worth showing (e.g. "BC7" for GPU textures).
+    pub format: Option<String>,
 }
 
 impl Decoded {
     fn still(image: RgbaImage, opaque: bool) -> Self {
         let source_size = [image.width(), image.height()];
-        Self { image, opaque, source_size, frames: Vec::new(), hdr: None, bit_depth: None }
+        Self { image, opaque, source_size, frames: Vec::new(), hdr: None, bit_depth: None, format: None }
     }
 }
 
@@ -120,6 +122,7 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
     match ext.as_str() {
         "svg" | "svgz" => return decode_svg(&bytes, vector_side),
         "psd" => return decode_psd(&bytes),
+        "dds" | "ktx" | "ktx2" => return decode_texture(&bytes, &ext, max_side, animate),
         "hdr" | "exr" => return decode_hdr(&bytes, max_side, animate),
         _ => {}
     }
@@ -133,7 +136,7 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
         if let Some(frames) = decode_animation(&bytes, &ext) {
             let image = frames[0].0.clone();
             let source_size = [image.width(), image.height()];
-            return Ok(Decoded { image, opaque: false, source_size, frames, hdr: None, bit_depth: Some(BitDepth::EIGHT) });
+            return Ok(Decoded { image, opaque: false, source_size, frames, hdr: None, bit_depth: Some(BitDepth::EIGHT), format: None });
         }
     }
     let img = match load_unlimited(&bytes) {
@@ -200,7 +203,7 @@ fn from_wic(path: &Path, max_side: u32, want_linear: bool) -> Result<Decoded, St
     let opaque = is_opaque(&image);
     let hdr = wic.linear.map(|l| high_precision(apply_orientation(l, wic.orientation), max_side, Light::DisplayLinear));
     let bit_depth = Some(BitDepth { bits: wic.bits, float: wic.float });
-    Ok(Decoded { image, opaque, source_size: wic.source_size, frames: Vec::new(), hdr, bit_depth })
+    Ok(Decoded { image, opaque, source_size: wic.source_size, frames: Vec::new(), hdr, bit_depth, format: None })
 }
 
 /// `image::load_from_memory` without the default 512 MB allocation cap: big images are
@@ -383,8 +386,31 @@ fn hdr_mips(pixels: Vec<f32>, size: [u32; 2]) -> Vec<HdrLevel> {
 /// Radiance HDR and OpenEXR hold linear scene light. Returns a CPU tone-mapped image (for
 /// thumbnails and as a fallback) plus, with `keep_linear`, the data for GPU tone mapping,
 /// scaled to at most `max_side`.
+/// DDS / KTX / KTX2 GPU textures (mip 0 of the first layer/face).
+fn decode_texture(bytes: &[u8], ext: &str, max_side: u32, keep_linear: bool) -> Result<Decoded, String> {
+    use crate::gputex::{self, Pixels};
+    let texture = match ext {
+        "dds" => gputex::decode_dds(bytes),
+        "ktx2" => gputex::decode_ktx2(bytes),
+        _ => gputex::decode_ktx1(bytes),
+    }?;
+    let format = Some(texture.format);
+    match texture.pixels {
+        Pixels::Ldr(image) => {
+            let opaque = is_opaque(&image);
+            Ok(Decoded { format, bit_depth: Some(BitDepth::EIGHT), ..Decoded::still(image, opaque) })
+        }
+        // Float textures (often HDR environment maps) get tone mapping and exposure.
+        Pixels::Float(img) => Ok(Decoded { format, ..from_float(img, max_side, keep_linear)? }),
+    }
+}
+
 fn decode_hdr(bytes: &[u8], max_side: u32, keep_linear: bool) -> Result<Decoded, String> {
-    let mut img = load_unlimited(bytes)?.into_rgba32f();
+    from_float(load_unlimited(bytes)?.into_rgba32f(), max_side, keep_linear)
+}
+
+/// Scene-linear float pixels: CPU tone-mapped image plus, with `keep_linear`, GPU exposure data.
+fn from_float(mut img: image::Rgba32FImage, max_side: u32, keep_linear: bool) -> Result<Decoded, String> {
     let (w, h) = img.dimensions();
     // Measure exposure on the full-resolution data, before any downscaling: shrinking averages
     // highlights into their surroundings and would give thumbnails a different (darker) exposure

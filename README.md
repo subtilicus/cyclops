@@ -62,7 +62,8 @@ Pass a folder or image path on the command line to open it directly. Network: br
 Network node, or type `\\server` or `\\server\share` in the path bar; visited servers are remembered.
 
 **Images:** JPEG, PNG/APNG, GIF, WebP, BMP, TIFF, ICO, TGA, DDS, HDR, EXR, QOI, PNM, SVG and PSD (composite)
-are decoded in-process; HEIC/HEIF, AVIF, JPEG XL, JPEG XR and camera RAW (DNG, CR2/CR3, NEF, ARW, RAF,
+are decoded in-process, as are GPU textures (DDS, KTX, KTX2: BC1–7, ETC1/2, EAC, ASTC, uncompressed
+and half/float, Zstandard-supercompressed KTX2; Basis Universal not yet); HEIC/HEIF, AVIF, JPEG XL, JPEG XR and camera RAW (DNG, CR2/CR3, NEF, ARW, RAF,
 ORF, RW2, …) go through the Windows Imaging Component, using the OS's (free) codec extensions.
 Animated GIF, WebP and APNG play in the viewer and preview. HDR/EXR are tone-mapped (auto exposure +
 ACES) with a live exposure slider.

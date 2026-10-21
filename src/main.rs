@@ -6,6 +6,7 @@ mod decode;
 mod diag;
 mod editor;
 mod fs;
+mod gputex;
 mod glass;
 mod hdr_gpu;
 mod icons;
@@ -35,7 +36,7 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Cyclops")
+            .with_title("Cyclops Image Browser")
             .with_app_id("cyclops")
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([640.0, 400.0])

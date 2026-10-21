@@ -50,6 +50,8 @@ pub struct Images {
     pub blur: Option<ColorImage>,
     /// Bits per channel of the source, when known.
     pub bit_depth: Option<decode::BitDepth>,
+    /// Storage format worth showing (e.g. "BC7").
+    pub format: Option<String>,
     pub decode_ms: f32,
 }
 
@@ -135,6 +137,7 @@ fn worker(
                     hdr: None,
                     blur: None,
                     bit_depth: None,
+                    format: None,
                     decode_ms: start.elapsed().as_secs_f32() * 1000.0,
                 })
                 .ok_or_else(|| "no thumbnail".to_owned());
@@ -147,7 +150,7 @@ fn worker(
         // RAW/HEIC thumbnails: Explorer's cached thumbnail is far faster than a full decode.
         if job.kind == Kind::Thumb && decode::prefers_shell_thumbnail(&job.path) {
             if let Some(main) = crate::shell::thumbnail_only(&job.path, job.max_side) {
-                let images = Images { source_size: main.size, main, screen: None, frames: Vec::new(), hdr: None, blur: None, bit_depth: None, decode_ms: 0.0 };
+                let images = Images { source_size: main.size, main, screen: None, frames: Vec::new(), hdr: None, blur: None, bit_depth: None, format: None, decode_ms: 0.0 };
                 if done_tx.send(Loaded { path: job.path, kind: job.kind, result: Ok(images) }).is_err() {
                     return;
                 }
@@ -177,7 +180,8 @@ fn worker(
             let blur = full.then(|| crate::glass::blurred(&main.pixels, main.size));
             let hdr = if full { d.hdr } else { None };
             let bit_depth = d.bit_depth;
-            Images { main, screen, source_size, frames, hdr, blur, bit_depth, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
+            let format = d.format;
+            Images { main, screen, source_size, frames, hdr, blur, bit_depth, format, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
         });
         crate::perflog::record(|| match &result {
             Ok(img) => format!(

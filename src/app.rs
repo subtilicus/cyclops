@@ -123,6 +123,8 @@ struct FullImage {
     /// Tiny blurred copy for frosted-glass overlays.
     blur: Option<TextureHandle>,
     bit_depth: Option<crate::decode::BitDepth>,
+    /// Storage format worth showing (e.g. "BC7" for GPU textures).
+    format: Option<String>,
 }
 
 struct HdrEdit {
@@ -851,6 +853,7 @@ impl CyclopsApp {
                                     })
                                     .collect(),
                                 bit_depth: images.bit_depth,
+                                format: images.format,
                                 blur: images.blur.map(|b| ctx.load_texture(format!("{name}#blur"), b, TextureOptions::LINEAR)),
                                 ready_at: ctx.input(|i| i.time),
                                 paused_at: None,
@@ -1948,8 +1951,13 @@ impl CyclopsApp {
         if let Some(s) = source_size {
             info += &format!("    {}×{}", s.x as u32, s.y as u32);
         }
-        if let Some(Full::Ready(FullImage { bit_depth: Some(depth), .. })) = self.full.get(&entry.path) {
-            info += &format!("    {}", depth.label());
+        if let Some(Full::Ready(img)) = self.full.get(&entry.path) {
+            if let Some(format) = &img.format {
+                info += &format!("    {format}");
+            }
+            if let Some(depth) = img.bit_depth {
+                info += &format!("    {}", depth.label());
+            }
         }
         info += &format!("    {}", fs::human_size(entry.size));
         if let Some(z) = zoom_pct {
@@ -2074,8 +2082,9 @@ impl CyclopsApp {
             self.animation_controls(ui, img_rect, &entry.path, 30.0);
             if let Some((size, ..)) = &full {
                 details.push(format!("{}×{}", size.x as u32, size.y as u32));
-                if let Some(Full::Ready(FullImage { bit_depth: Some(depth), .. })) = self.full.get(&entry.path) {
-                    details.push(depth.label());
+                if let Some(Full::Ready(img)) = self.full.get(&entry.path) {
+                    details.extend(img.format.clone());
+                    details.extend(img.bit_depth.map(|d| d.label()));
                 }
             } else if let Some(Full::Failed(e)) = self.full.get(&entry.path) {
                 details.push(format!("error: {e}"));
