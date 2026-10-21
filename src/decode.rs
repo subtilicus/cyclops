@@ -188,9 +188,10 @@ fn high_precision(mut img: image::Rgba32FImage, max_side: u32, light: Light) -> 
 }
 
 /// Formats whose grid thumbnails should come from Explorer's cache before decoding ourselves
-/// (large or slow to decode).
+/// (large or slow to decode). Not HDR/EXR: their look depends on tone mapping, and a
+/// thumbnail made by another program (e.g. Photoshop) wouldn't match Cyclops's own view.
 pub fn prefers_shell_thumbnail(path: &Path) -> bool {
-    crate::wic::handles(path) || matches!(extension(path).as_str(), "tif" | "tiff" | "psd" | "exr" | "hdr")
+    crate::wic::handles(path) || matches!(extension(path).as_str(), "tif" | "tiff" | "psd")
 }
 
 fn from_wic(path: &Path, max_side: u32, want_linear: bool) -> Result<Decoded, String> {
