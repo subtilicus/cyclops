@@ -333,7 +333,10 @@ fn ktx2_set(bytes: &[u8], first_only: bool) -> Result<TextureSet, String> {
     use ktx2::SupercompressionScheme as S;
     let reader = ktx2::Reader::new(bytes).map_err(|e| format!("KTX2: {e:?}"))?;
     let header = reader.header();
-    if header.format.is_none() || header.supercompression_scheme == Some(S::BasisLZ) {
+    // Basis Universal: ETC1S (BasisLZ), UASTC (format undefined) and UASTC/ASTC HDR, which is
+    // declared as an ASTC SFLOAT format (VK_FORMAT_ASTC_*_SFLOAT_BLOCK = 1000066000..13).
+    let astc_hdr = header.format.is_some_and(|f| (1_000_066_000..=1_000_066_013).contains(&f.value()));
+    if header.format.is_none() || header.supercompression_scheme == Some(S::BasisLZ) || astc_hdr {
         return crate::basis::decode_ktx2(bytes, first_only);
     }
     let format = header.format.expect("checked above");

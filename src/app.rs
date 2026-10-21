@@ -2830,7 +2830,7 @@ impl CyclopsApp {
             return;
         }
         let row_h = 30.0;
-        let panel = Rect::from_min_size(area.min + vec2(16.0, 16.0), vec2(250.0, rows.len() as f32 * row_h + 12.0));
+        let panel = Rect::from_min_size(area.min + vec2(16.0, 16.0), vec2(300.0, rows.len() as f32 * row_h + 12.0));
         let painter = ui.painter().clone();
         crate::glass::paint(&painter, panel, 12.0, self.backdrop);
         let fg = theme::DARK.text;

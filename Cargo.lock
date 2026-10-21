@@ -518,6 +518,7 @@ version = "0.1.0"
 dependencies = [
  "bcdec_rs",
  "bytemuck",
+ "cc",
  "chrono",
  "crossbeam-channel",
  "ddsfile",
