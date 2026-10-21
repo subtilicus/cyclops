@@ -102,8 +102,8 @@ fn decode(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Texture, String> {
         Fmt::Bc3 => block(t::decode_bc3)?,
         Fmt::Bc4 => block(t::decode_bc4)?,
         Fmt::Bc5 => block(t::decode_bc5)?,
-        Fmt::Bc6h { signed: true } => block(t::decode_bc6_signed)?,
-        Fmt::Bc6h { signed: false } => block(t::decode_bc6_unsigned)?,
+        // BC6H is HDR: decode to real floats so it gets tone mapping and exposure.
+        Fmt::Bc6h { signed } => return Ok(Texture { pixels: Pixels::Float(decode_bc6h(data, w, h, signed)?), format: fmt.label() }),
         Fmt::Bc7 => block(t::decode_bc7)?,
         Fmt::Etc1 => block(t::decode_etc1)?,
         Fmt::Etc2Rgb => block(t::decode_etc2_rgb)?,
@@ -142,6 +142,36 @@ fn decode(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Texture, String> {
         }
     };
     Ok(Texture { pixels: Pixels::Ldr(ldr), format: fmt.label() })
+}
+
+/// BC6H blocks to linear RGB floats (alpha 1), via bcdec's float decoder.
+fn decode_bc6h(data: &[u8], w: u32, h: u32, signed: bool) -> Result<Rgba32FImage, String> {
+    let (wu, hu) = (w as usize, h as usize);
+    let (bw, bh) = (wu.div_ceil(4), hu.div_ceil(4));
+    if data.len() < bw * bh * 16 {
+        return Err("texture data is truncated".into());
+    }
+    let mut out = vec![0f32; wu * hu * 4];
+    let mut block = [0f32; 4 * 4 * 3];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let i = by * bw + bx;
+            bcdec_rs::bc6h_float(&data[i * 16..i * 16 + 16], &mut block, 4 * 3, signed);
+            // Copy the block's pixels that fall inside the image (edges may be partial).
+            for y in 0..4 {
+                for x in 0..4 {
+                    let (px, py) = (bx * 4 + x, by * 4 + y);
+                    if px < wu && py < hu {
+                        let src = (y * 4 + x) * 3;
+                        let dst = (py * wu + px) * 4;
+                        out[dst..dst + 3].copy_from_slice(&block[src..src + 3]);
+                        out[dst + 3] = 1.0;
+                    }
+                }
+            }
+        }
+    }
+    Rgba32FImage::from_raw(w, h, out).ok_or_else(|| "texture size mismatch".to_owned())
 }
 
 // ---------------------------------------------------------------- DDS

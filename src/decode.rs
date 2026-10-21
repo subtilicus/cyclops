@@ -401,7 +401,12 @@ fn decode_texture(bytes: &[u8], ext: &str, max_side: u32, keep_linear: bool) -> 
             Ok(Decoded { format, bit_depth: Some(BitDepth::EIGHT), ..Decoded::still(image, opaque) })
         }
         // Float textures (often HDR environment maps) get tone mapping and exposure.
-        Pixels::Float(img) => Ok(Decoded { format, ..from_float(img, max_side, keep_linear)? }),
+        Pixels::Float(img) => {
+            // BC6H and RGBA16F store half floats; the rest are full 32-bit floats.
+            let half = matches!(format.as_deref(), Some("BC6H" | "RGBA16F"));
+            let bit_depth = Some(BitDepth { bits: if half { 16 } else { 32 }, float: true });
+            Ok(Decoded { format, bit_depth, ..from_float(img, max_side, keep_linear)? })
+        }
     }
 }
 

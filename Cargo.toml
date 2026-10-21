@@ -10,6 +10,7 @@ keywords = ["image", "viewer", "browser", "gpu", "wgpu"]
 categories = ["multimedia::images", "graphics"]
 
 [dependencies]
+bcdec_rs = "0.2.0"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 crossbeam-channel = "0.5.17"

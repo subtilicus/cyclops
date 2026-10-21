@@ -2315,7 +2315,8 @@ fn setting_row(ui: &mut egui::Ui, title: &str, description: &str, control: impl 
     let p = theme::p();
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.set_width((ui.available_width() - 250.0).max(160.0));
+            // Leave room for the widest control (three-way segmented) so no row widens the window.
+            ui.set_width((ui.available_width() - 290.0).max(160.0));
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(egui::RichText::new(title).size(14.0).color(p.text));
             if !description.is_empty() {
@@ -2342,7 +2343,7 @@ fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(
                     .fill(if selected { p.surface_hover } else { Color32::TRANSPARENT })
                     .stroke(if selected { Stroke::new(1.0, p.border) } else { Stroke::NONE })
                     .corner_radius(CornerRadius::same(7))
-                    .min_size(vec2(84.0, 28.0));
+                    .min_size(vec2(78.0, 28.0));
                 if ui.add(button).clicked() && !selected {
                     *value = *option;
                     changed = true;
