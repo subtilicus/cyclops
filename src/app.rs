@@ -78,6 +78,10 @@ struct Settings {
     wheel_zooms: bool,
     show_dates: bool,
     show_info_bar: bool,
+    /// Opening an image from the browser goes fullscreen.
+    open_fullscreen: bool,
+    /// Fit enlarges images smaller than the view (otherwise they stop at 100%).
+    enlarge_small: bool,
     video_muted: bool,
     video_volume: f32,
     /// Folders | thumbnails | preview, instead of folders | thumbnails.
@@ -410,6 +414,8 @@ pub struct CyclopsApp {
     full: HashMap<PathBuf, Full>,
     full_lru: VecDeque<PathBuf>,
     fullscreen: bool,
+    /// Fullscreen was switched on by opening the viewer (and is undone when it closes).
+    fullscreen_for_viewer: bool,
     pending_key_zoom: f32,
     pending_action: Option<FileAction>,
     /// What's behind glass overlays this frame (set when the viewer/preview draws its image).
@@ -449,6 +455,8 @@ impl CyclopsApp {
             wheel_zooms: flag("wheel_zooms", true),
             show_dates: flag("show_dates", true),
             show_info_bar: flag("show_info_bar", true),
+            open_fullscreen: flag("open_fullscreen", true),
+            enlarge_small: flag("enlarge_small", true),
             video_muted: flag("video_muted", false),
             video_volume: stored("video_volume").and_then(|s| s.parse().ok()).unwrap_or(1.0),
             three_pane: flag("three_pane", false),
@@ -512,6 +520,7 @@ impl CyclopsApp {
             full: HashMap::new(),
             full_lru: VecDeque::new(),
             fullscreen: false,
+            fullscreen_for_viewer: false,
             pending_key_zoom: 1.0,
             video: None,
             pending_action: None,
@@ -732,8 +741,14 @@ impl CyclopsApp {
     }
 
     fn open_viewer(&mut self, index: usize) {
+        let fresh = self.viewer.is_none();
         self.viewer = Some(Viewer { index, view: ZoomPan::default(), wheel_accum: 0.0 });
         self.selected = Some(index);
+        // Only when coming from the browser; moving between images keeps whatever the user chose.
+        if fresh && self.settings.open_fullscreen && !self.fullscreen {
+            self.set_fullscreen(&self.ctx.clone(), true);
+            self.fullscreen_for_viewer = true;
+        }
     }
 
     fn close_viewer(&mut self, ctx: &egui::Context) {
@@ -741,9 +756,11 @@ impl CyclopsApp {
             self.selected = Some(v.index);
             self.scroll_to_selected = true;
         }
-        if self.fullscreen {
+        // Undo fullscreen only if the viewer turned it on; a fullscreen browser stays fullscreen.
+        if self.fullscreen && self.fullscreen_for_viewer {
             self.set_fullscreen(ctx, false);
         }
+        self.fullscreen_for_viewer = false;
     }
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
@@ -1088,6 +1105,12 @@ impl CyclopsApp {
         });
         setting_row(ui, "Info bar", "File name, size and zoom at the bottom of the viewer.", |ui| {
             toggle(ui, &mut self.settings.show_info_bar);
+        });
+        setting_row(ui, "Open images fullscreen", "Double-click or Enter shows the image fullscreen; Esc returns.", |ui| {
+            toggle(ui, &mut self.settings.open_fullscreen);
+        });
+        setting_row(ui, "Enlarge small images", "Fit scales images up to fill the screen, not just down.", |ui| {
+            toggle(ui, &mut self.settings.enlarge_small);
         });
     }
 
@@ -1684,7 +1707,8 @@ impl CyclopsApp {
             self.open_viewer(t);
         }
         if esc {
-            if self.fullscreen && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            // Fullscreen the user chose inside the viewer: Esc leaves fullscreen first.
+            if self.fullscreen && !self.fullscreen_for_viewer && ctx.input(|i| i.key_pressed(Key::Escape)) {
                 self.set_fullscreen(ctx, false);
             } else {
                 self.close_viewer(ctx);
@@ -1768,9 +1792,11 @@ impl CyclopsApp {
 
         let mut zoom_pct = None;
         if let (Some(natural), Some(v)) = (natural, self.viewer.as_mut()) {
-            // Photos never upscale past 100% (1 source px = 1 screen px); videos fill the view.
+            // Fit fills the view (longest side); with "Enlarge small images" off, photos stop at
+            // 100% (1 source px = 1 screen px). Videos always fill.
             let fill = (rect.width() / natural.x).min(rect.height() / natural.y);
-            let fit = if entry.is_video || source_size.is_none() { fill } else { fill.min(1.0 / ppp) };
+            let enlarge = entry.is_video || source_size.is_none() || self.settings.enlarge_small;
+            let fit = if enlarge { fill } else { fill.min(1.0 / ppp) };
             let factor = wheel_zoom_factor(wheel) * pinch * self.pending_key_zoom;
             let focus = if wheel != 0.0 || pinch != 1.0 { resp.hover_pos().unwrap_or(rect.center()) } else { rect.center() };
             let (draw, scale) = v.view.update(&ctx, rect, &resp, natural, fit, factor, focus, source_size.is_some());
@@ -1953,7 +1979,7 @@ impl CyclopsApp {
             let natural = full.as_ref().map(|f| f.0).or_else(|| thumb.as_ref().map(|t| t.size_vec2()));
             if let Some(natural) = natural {
                 let fill = (img_rect.width() / natural.x).min(img_rect.height() / natural.y);
-                let fit = if full.is_some() { fill.min(1.0 / ppp) } else { fill };
+                let fit = if full.is_some() && !self.settings.enlarge_small { fill.min(1.0 / ppp) } else { fill };
                 // In the pane the wheel always zooms (there's nothing to scroll).
                 let (plain, ctrl, pinch) = wheel_input(ui.ctx(), resp.hovered());
                 let factor = wheel_zoom_factor(plain + ctrl) * pinch;
@@ -2709,6 +2735,7 @@ impl eframe::App for CyclopsApp {
                     || (i.modifiers.alt && i.key_pressed(Key::Enter))
             });
         if fullscreen_key {
+            self.fullscreen_for_viewer = false;
             self.set_fullscreen(&ctx, !self.fullscreen);
         } else if self.fullscreen && self.viewer.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.set_fullscreen(&ctx, false);
@@ -2780,6 +2807,8 @@ impl eframe::App for CyclopsApp {
         storage.set_string("wheel_zooms", self.settings.wheel_zooms.to_string());
         storage.set_string("show_dates", self.settings.show_dates.to_string());
         storage.set_string("show_info_bar", self.settings.show_info_bar.to_string());
+        storage.set_string("open_fullscreen", self.settings.open_fullscreen.to_string());
+        storage.set_string("enlarge_small", self.settings.enlarge_small.to_string());
         storage.set_string("video_muted", self.settings.video_muted.to_string());
         storage.set_string("video_volume", self.settings.video_volume.to_string());
         storage.set_string("three_pane", self.settings.three_pane.to_string());
