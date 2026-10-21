@@ -471,6 +471,8 @@ pub struct CyclopsApp {
     typeahead: (String, f64),
     /// Window focus last frame; regaining focus re-syncs the folder (e.g. after editing).
     was_focused: bool,
+    /// Whether the restored window geometry has been checked against the current screen.
+    window_checked: bool,
     /// Skin and material the native window was last styled for.
     chrome_state: Option<(bool, crate::chrome::Material)>,
     dialog: Option<Dialog>,
@@ -593,6 +595,7 @@ impl CyclopsApp {
             typeahead: (String::new(), 0.0),
             was_focused: true,
             chrome_state: None,
+            window_checked: false,
             dialog: None,
             toast: None,
             preview_view: ZoomPan::default(),
@@ -2706,6 +2709,41 @@ impl CyclopsApp {
         self.dialog = Some(Dialog::Rename { path, text, error: None, fresh: true });
     }
 
+    /// The window size/position is restored from last time, which may have been on a bigger or
+    /// different display. If it doesn't fit the current monitor, shrink and centre it so the title
+    /// bar and edges are reachable.
+    fn fit_window_to_screen(&mut self, ctx: &egui::Context) {
+        if self.window_checked {
+            return;
+        }
+        let (outer, monitor, maximized, fullscreen) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.outer_rect, v.monitor_size, v.maximized.unwrap_or(false), v.fullscreen.unwrap_or(false))
+        });
+        // A fullscreen state restored from last session (closed while viewing an image) has no
+        // title bar to grab: always start as a normal window. Fullscreen only comes from the viewer.
+        if fullscreen && !self.fullscreen {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            return; // check the windowed geometry once it has taken effect
+        }
+        let (Some(outer), Some(monitor)) = (outer, monitor) else { return }; // not known yet
+        self.window_checked = true;
+        if maximized || fullscreen || monitor.x <= 0.0 || monitor.y <= 0.0 {
+            return;
+        }
+        let screen = Rect::from_min_size(egui::Pos2::ZERO, monitor);
+        // Leave room for the taskbar (egui doesn't know the work area, only the monitor size).
+        let fits = outer.width() <= monitor.x - 16.0
+            && outer.height() <= monitor.y - 56.0
+            && screen.contains(outer.min + vec2(40.0, 10.0))
+            && outer.max.y <= monitor.y - 40.0;
+        if !fits {
+            let size = vec2((monitor.x * 0.85).min(outer.width()), (monitor.y * 0.85).min(outer.height()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(((monitor - size) / 2.0).to_pos2()));
+        }
+    }
+
     /// A chrome surface colour: opaque for the Solid material, otherwise translucent so the
     /// Mica/Acrylic backdrop shows through (`opacity` 0–1).
     fn chrome_fill(&self, color: Color32, opacity: f32) -> Color32 {
@@ -2927,6 +2965,7 @@ impl eframe::App for CyclopsApp {
         theme::sync(&ctx);
         self.backdrop = None;
         // Native title bar follows the skin (caption matching the toolbar, rounded corners).
+        self.fit_window_to_screen(&ctx);
         let dark = ctx.theme() == egui::Theme::Dark;
         let material = self.settings.material;
         if self.chrome_state != Some((dark, material)) {
