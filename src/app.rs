@@ -418,6 +418,8 @@ pub struct CyclopsApp {
     settings_page: Option<SettingsPage>,
     /// Photo editors found on this PC (for the settings menu).
     detected_editors: Vec<PathBuf>,
+    /// Type-to-find in the grid: the prefix typed so far and when the last key came in.
+    typeahead: (String, f64),
     /// Window focus last frame; regaining focus re-syncs the folder (e.g. after editing).
     was_focused: bool,
     /// Skin and material the native window was last styled for.
@@ -516,6 +518,7 @@ impl CyclopsApp {
             backdrop: None,
             settings_page: None,
             detected_editors: crate::editor::detect(),
+            typeahead: (String::new(), 0.0),
             was_focused: true,
             chrome_state: None,
             dialog: None,
@@ -1281,6 +1284,7 @@ impl CyclopsApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
+        self.type_to_find(ctx);
         let n = self.entries.len();
         let cols = self.grid_cols.max(1);
         let page = cols * ((self.grid_viewport.height() / self.cell_size().y).floor() as usize).max(1);
@@ -1325,7 +1329,7 @@ impl CyclopsApp {
         }
         if let Some(sel) = self.selected {
             let (delete, rename) = ctx.input(|i| (i.key_pressed(Key::Delete), i.key_pressed(Key::F2)));
-            let edit = ctx.input(|i| i.modifiers.is_none() && i.key_pressed(Key::E));
+            let edit = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::E));
             if delete {
                 self.pending_action = Some(FileAction::Delete(sel));
             } else if rename {
@@ -1535,8 +1539,61 @@ impl CyclopsApp {
         }
     }
 
+    /// Explorer-style type-to-find: characters typed within a second form a prefix and select the
+    /// next file whose name starts with it; repeating one letter cycles through its matches.
+    fn type_to_find(&mut self, ctx: &egui::Context) {
+        const RESET_AFTER: f64 = 1.0;
+        let (typed, now) = ctx.input(|i| {
+            let typed: String = if i.modifiers.command || i.modifiers.alt {
+                String::new()
+            } else {
+                i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.as_str()) } else { None }).collect()
+            };
+            (typed, i.time)
+        });
+        if typed.is_empty() || self.entries.is_empty() {
+            return;
+        }
+        let (buffer, last) = &mut self.typeahead;
+        if now - *last > RESET_AFTER {
+            buffer.clear();
+        }
+        *last = now;
+        // A leading space would be invisible and is almost never intended.
+        if buffer.is_empty() && typed.trim().is_empty() {
+            return;
+        }
+        buffer.push_str(&typed.to_lowercase());
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(RESET_AFTER));
+
+        let n = self.entries.len();
+        let current = self.selected.unwrap_or(0).min(n - 1);
+        let first = buffer.chars().next().unwrap_or_default();
+        let repeating = buffer.chars().all(|c| c == first);
+        // Repeating one letter cycles to the next match; a longer prefix refines from the current file.
+        let (prefix, start) = if repeating && buffer.chars().count() > 1 {
+            (first.to_string(), current + 1)
+        } else if buffer.chars().count() == 1 {
+            (buffer.clone(), current + 1)
+        } else {
+            (buffer.clone(), current)
+        };
+        let found = (0..n)
+            .map(|k| (start + k) % n)
+            .find(|&i| self.entries[i].name.to_lowercase().starts_with(&prefix));
+        if let Some(i) = found {
+            self.selected = Some(i);
+            self.scroll_to_selected = true;
+        }
+    }
+
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            let (prefix, last) = &self.typeahead;
+            if !prefix.is_empty() && ui.input(|i| i.time) - last <= 1.0 {
+                ui.label(egui::RichText::new(format!("Find: {prefix}")).small().color(theme::p().accent));
+                ui.separator();
+            }
             let dirs = self.entries.iter().filter(|e| e.is_dir).count();
             let videos = self.entries.iter().filter(|e| e.is_video).count();
             let images = self.entries.len() - dirs - videos;
@@ -1566,7 +1623,7 @@ impl CyclopsApp {
         let Some(v) = &self.viewer else { return };
         let index = v.index;
         let (delete, rename) = ctx.input(|i| (i.key_pressed(Key::Delete), i.key_pressed(Key::F2)));
-        let edit = ctx.input(|i| i.modifiers.is_none() && i.key_pressed(Key::E));
+        let edit = ctx.input(|i| (i.modifiers.is_none() || i.modifiers.command) && i.key_pressed(Key::E));
         if delete {
             self.pending_action = Some(FileAction::Delete(index));
         } else if rename {
@@ -2218,6 +2275,8 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) {
 
 /// The right-click menu for a file or folder.
 fn file_menu(ui: &mut egui::Ui, edit_label: &str, index: usize, entry: &Entry, include_open: bool, action: &mut Option<FileAction>) {
+    // In the browser plain letters find files, so editing is Ctrl+E there; the viewer takes E.
+    let edit_shortcut = if include_open { "Ctrl+E" } else { "E" };
     let parent = entry.path.parent().map(Path::to_path_buf);
     ui.set_min_width(200.0);
     let mut pick = |a: FileAction, ui: &mut egui::Ui| {
@@ -2227,7 +2286,7 @@ fn file_menu(ui: &mut egui::Ui, edit_label: &str, index: usize, entry: &Entry, i
     if include_open && ui.add(egui::Button::new("Open").shortcut_text("Enter")).clicked() {
         pick(FileAction::Open(index), ui);
     }
-    if !entry.is_dir && ui.add(egui::Button::new(edit_label).shortcut_text("E")).clicked() {
+    if !entry.is_dir && ui.add(egui::Button::new(edit_label).shortcut_text(edit_shortcut)).clicked() {
         pick(FileAction::Edit(index), ui);
     }
     if ui.button("Show in Explorer").clicked() {
@@ -2640,11 +2699,14 @@ impl eframe::App for CyclopsApp {
         self.receive(&ctx);
 
         // F, F11 and Alt+Enter toggle fullscreen everywhere (unless typing in a text field).
+        let in_viewer = self.viewer.is_some();
         let fullscreen_key = self.dialog.is_none()
             && self.settings_page.is_none()
             && !ctx.egui_wants_keyboard_input()
             && ctx.input(|i| {
-                i.key_pressed(Key::F11) || (i.key_pressed(Key::F) && i.modifiers.is_none()) || (i.modifiers.alt && i.key_pressed(Key::Enter))
+                i.key_pressed(Key::F11)
+                    || (in_viewer && i.key_pressed(Key::F) && i.modifiers.is_none())
+                    || (i.modifiers.alt && i.key_pressed(Key::Enter))
             });
         if fullscreen_key {
             self.set_fullscreen(&ctx, !self.fullscreen);

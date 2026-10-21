@@ -47,12 +47,15 @@ multi-threaded decoding (zune-jpeg fast path), neighbour prefetch and a zoom/pan
 | Browser | Arrows / PgUp / PgDn / Home / End     | Move selection            |
 | Browser | Enter / double-click                  | Open image or folder      |
 | Browser | Backspace · Alt+← · F5                | Up · Back · Refresh       |
+| Browser | Type letters/digits                   | Jump to the first file starting with them |
+| Browser | Ctrl+E · Ctrl+Shift+N                 | Edit in external editor · New folder |
 | Both    | F2 · Del · right-click                | Rename · Delete (Recycle Bin) · menu with Show in Explorer |
 | Viewer  | → ↓ Space PgDn / ← ↑ Backspace PgUp   | Next / previous image     |
 | Viewer  | Mouse wheel · pinch · + / -           | Smooth zoom around cursor |
 | Viewer  | Left-drag · double-click              | Pan · toggle fit / 100%   |
 | Viewer  | 0 · 1 · Esc                           | Fit · 100% · Back         |
-| Anywhere| F · F11 · Alt+Enter                   | Toggle fullscreen         |
+| Anywhere| F11 · Alt+Enter (F in the viewer)     | Toggle fullscreen         |
+| Viewer  | E                                     | Edit in external editor   |
 | Video   | Space · M · wheel over volume         | Play/pause · Mute · Volume |
 
 Pass a folder or image path on the command line to open it directly. Network: browse via the
