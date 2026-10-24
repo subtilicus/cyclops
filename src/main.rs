@@ -10,6 +10,7 @@ mod fs;
 mod gputex;
 mod glass;
 mod hdr_gpu;
+mod hwjpeg;
 mod icons;
 mod loader;
 mod ops;
@@ -35,6 +36,9 @@ fn main() -> eframe::Result {
             unsafe { std::env::set_var(key, value) };
         }
     }
+    // Open the GPU JPEG decoder while the window is being created (it takes ~100 ms); the
+    // Settings switch decides whether it is used.
+    hwjpeg::warm_up();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cyclops Image Browser")

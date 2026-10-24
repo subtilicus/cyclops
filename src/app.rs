@@ -56,10 +56,11 @@ enum SettingsPage {
     Viewer,
     Editor,
     Developer,
+    About,
 }
 
 impl SettingsPage {
-    const ALL: [Self; 5] = [Self::Appearance, Self::Browsing, Self::Viewer, Self::Editor, Self::Developer];
+    const ALL: [Self; 6] = [Self::Appearance, Self::Browsing, Self::Viewer, Self::Editor, Self::Developer, Self::About];
 
     fn label(self) -> &'static str {
         match self {
@@ -68,6 +69,7 @@ impl SettingsPage {
             Self::Viewer => "Viewer",
             Self::Editor => "Editor",
             Self::Developer => "Developer",
+            Self::About => "About",
         }
     }
 }
@@ -88,6 +90,8 @@ struct Settings {
     three_pane: bool,
     /// Developer: write decode timings to a log file.
     perf_log: bool,
+    /// Decode large JPEGs on the GPU's video engine.
+    hw_jpeg: bool,
     /// External photo editor; `None` uses Windows' "Edit" action.
     editor: Option<PathBuf>,
     /// Window material behind the translucent chrome.
@@ -415,6 +419,8 @@ pub struct CyclopsApp {
     ctx: egui::Context,
     /// eframe's wgpu state, for custom GPU drawing (HDR tone mapping).
     render_state: Option<eframe::egui_wgpu::RenderState>,
+    /// Graphics adapter and API, for the About page.
+    gpu_info: String,
     settings: Settings,
     roots: Vec<(String, PathBuf)>,
     tree_children: HashMap<PathBuf, Vec<PathBuf>>,
@@ -508,6 +514,7 @@ impl CyclopsApp {
             video_volume: stored("video_volume").and_then(|s| s.parse().ok()).unwrap_or(1.0),
             three_pane: flag("three_pane", false),
             perf_log: flag("perf_log", false),
+            hw_jpeg: flag("hw_jpeg", true),
             editor: stored("editor").filter(|s| !s.is_empty()).map(PathBuf::from),
             material: stored("material")
                 .and_then(|s| crate::chrome::Material::from_label(&s))
@@ -515,6 +522,8 @@ impl CyclopsApp {
             preview_width: stored("preview_width").and_then(|s| s.parse().ok()).unwrap_or(460.0),
         };
         theme::install(&cc.egui_ctx);
+        // Open the GPU JPEG decoder now, so it is ready by the time thumbnails are requested.
+        crate::hwjpeg::set_enabled(settings.hw_jpeg);
         if let Some(rs) = &cc.wgpu_render_state {
             crate::hdr_gpu::init(rs);
             let info = rs.adapter.get_info();
@@ -552,6 +561,13 @@ impl CyclopsApp {
             loader: Loader::new(cc.egui_ctx.clone()),
             ctx: cc.egui_ctx.clone(),
             render_state: cc.wgpu_render_state.clone(),
+            gpu_info: cc.wgpu_render_state.as_ref().map_or_else(
+                || "Unknown".to_owned(),
+                |rs| {
+                    let info = rs.adapter.get_info();
+                    format!("{} · {:?}", info.name, info.backend)
+                },
+            ),
             settings,
             roots,
             tree_children: HashMap::new(),
@@ -1133,8 +1149,6 @@ impl CyclopsApp {
                                     page = candidate;
                                 }
                             }
-                            ui.add_space((ui.available_height() - 18.0).max(0.0));
-                            ui.label(egui::RichText::new(concat!("Cyclops ", env!("CARGO_PKG_VERSION"))).small().color(p.text_dim));
                         });
                     });
                 // Content
@@ -1162,6 +1176,7 @@ impl CyclopsApp {
                                 SettingsPage::Viewer => self.settings_viewer(ui),
                                 SettingsPage::Editor => self.settings_editor(ui),
                                 SettingsPage::Developer => self.settings_developer(ui),
+                                SettingsPage::About => self.settings_about(ui),
                             });
                         });
                     });
@@ -1216,6 +1231,14 @@ impl CyclopsApp {
         setting_row(ui, "Enlarge small images", "Fit scales images up to fill the screen, not just down.", |ui| {
             toggle(ui, &mut self.settings.enlarge_small);
         });
+        setting_row(
+            ui,
+            "Hardware JPEG decoding",
+            "Large photos decode on the graphics card's JPEG engine, about three times faster. Others use the CPU.",
+            |ui| {
+                toggle(ui, &mut self.settings.hw_jpeg);
+            },
+        );
     }
 
     fn settings_editor(&mut self, ui: &mut egui::Ui) {
@@ -1297,6 +1320,86 @@ impl CyclopsApp {
                 ui.add(egui::Label::new(egui::RichText::new(crate::perflog::path().display().to_string()).small().color(theme::p().text_dim)).truncate());
             });
         }
+    }
+
+    fn settings_about(&mut self, ui: &mut egui::Ui) {
+        let p = theme::p();
+        const REPO: &str = env!("CARGO_PKG_REPOSITORY");
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
+            app_mark(ui.painter(), rect, p.accent);
+            ui.add_space(14.0);
+            ui.vertical(|ui| {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Cyclops Image Browser").size(20.0).color(p.text_strong));
+                ui.label(egui::RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).size(13.0).color(p.text_dim));
+            });
+        });
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new(env!("CARGO_PKG_DESCRIPTION")).size(13.0).color(p.text));
+        ui.add_space(16.0);
+
+        let jpeg = crate::hwjpeg::status();
+        let rows = [
+            ("Graphics", self.gpu_info.clone()),
+            ("JPEG decoding", jpeg.clone()),
+            ("Licence", "MIT or Apache-2.0".to_owned()),
+        ];
+        egui::Frame::NONE
+            .fill(p.surface)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::Grid::new("about-info").num_columns(2).spacing(vec2(18.0, 8.0)).show(ui, |ui| {
+                    for (label, value) in &rows {
+                        ui.label(egui::RichText::new(*label).color(p.text_dim));
+                        ui.add(egui::Label::new(egui::RichText::new(value).color(p.text)).truncate());
+                        ui.end_row();
+                    }
+                    ui.label(egui::RichText::new("Source code").color(p.text_dim));
+                    ui.hyperlink_to(REPO.trim_start_matches("https://"), REPO);
+                    ui.end_row();
+                });
+            });
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            let button = |text: &str| {
+                egui::Button::new(text)
+                    .fill(p.surface)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(vec2(0.0, 30.0))
+            };
+            if ui.add(button("Report a problem…")).clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{REPO}/issues")));
+            }
+            if ui.add(button("Copy system info")).on_hover_text("For bug reports").clicked() {
+                let info = format!(
+                    "Cyclops {}\nGraphics: {}\nJPEG decoding: {jpeg}\nOS: {} {}",
+                    env!("CARGO_PKG_VERSION"),
+                    self.gpu_info,
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                );
+                ui.ctx().copy_text(info);
+                self.show_toast(&ui.ctx().clone(), "System info copied".to_owned());
+            }
+        });
+        ui.add_space(18.0);
+        ui.label(egui::RichText::new("Built with open source").size(13.0).color(p.text));
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(
+                "egui and eframe, wgpu, image, zune-jpeg, resvg, psd, texture2ddecoder, bcdec_rs, ddsfile, ktx2, ruzstd, \
+                 Basis Universal (Apache-2.0, Binomial), Zstandard (BSD, Meta) and windows-rs.",
+            )
+            .size(12.0)
+            .color(p.text_dim),
+        );
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new("© 2026 Martin Vestergaard Madsen").size(12.0).color(p.text_dim));
     }
 
     fn folder_tree(&mut self, ui: &mut egui::Ui) {
@@ -2414,6 +2517,29 @@ fn video_badge(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
     icons::paint(painter, Rect::from_center_size(center, Vec2::splat(radius * 1.1)), Icon::Play, Color32::WHITE);
 }
 
+/// Cyclops's mark: a single eye in a rounded tile.
+fn app_mark(painter: &egui::Painter, rect: Rect, accent: Color32) {
+    painter.rect_filled(rect, CornerRadius::same(16), Color32::from_rgb(18, 22, 30));
+    painter.rect_stroke(rect, CornerRadius::same(16), Stroke::new(1.0, Color32::from_white_alpha(30)), egui::StrokeKind::Inside);
+    let c = rect.center();
+    let w = rect.width() * 0.36;
+    // Almond-shaped eye outline from two arcs.
+    let lid = |sign: f32| -> Vec<egui::Pos2> {
+        (0..=24)
+            .map(|i| {
+                let t = i as f32 / 24.0 * std::f32::consts::PI;
+                pos2(c.x - w * t.cos(), c.y + sign * w * 0.62 * t.sin())
+            })
+            .collect()
+    };
+    let stroke = Stroke::new(2.4, Color32::from_white_alpha(220));
+    painter.add(egui::Shape::line(lid(-1.0), stroke));
+    painter.add(egui::Shape::line(lid(1.0), stroke));
+    painter.circle_filled(c, w * 0.5, accent);
+    painter.circle_filled(c, w * 0.22, Color32::from_rgb(10, 12, 16));
+    painter.circle_filled(c + vec2(-w * 0.16, -w * 0.16), w * 0.08, Color32::from_white_alpha(230));
+}
+
 /// A settings row: title and optional description on the left, the control on the right.
 fn setting_row(ui: &mut egui::Ui, title: &str, description: &str, control: impl FnOnce(&mut egui::Ui)) {
     let p = theme::p();
@@ -3040,6 +3166,7 @@ impl eframe::App for CyclopsApp {
             self.chrome_state = Some((dark, material));
         }
         crate::perflog::set_enabled(self.settings.perf_log);
+        crate::hwjpeg::set_enabled(self.settings.hw_jpeg);
         // Coming back to the window (e.g. from the photo editor): pick up changed files.
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if focused && !self.was_focused {
@@ -3142,6 +3269,7 @@ impl eframe::App for CyclopsApp {
         storage.set_string("video_volume", self.settings.video_volume.to_string());
         storage.set_string("three_pane", self.settings.three_pane.to_string());
         storage.set_string("perf_log", self.settings.perf_log.to_string());
+        storage.set_string("hw_jpeg", self.settings.hw_jpeg.to_string());
         storage.set_string("material", self.settings.material.label().to_owned());
         storage.set_string("editor", self.settings.editor.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
         storage.set_string("preview_width", self.settings.preview_width.to_string());

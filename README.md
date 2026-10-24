@@ -67,7 +67,13 @@ and half/float, Zstandard-supercompressed KTX2, Basis Universal ETC1S/UASTC/UAST
 step through mips, array layers and cube faces with Ctrl+arrows); HEIC/HEIF, AVIF, JPEG XL, JPEG XR and camera RAW (DNG, CR2/CR3, NEF, ARW, RAF,
 ORF, RW2, …) go through the Windows Imaging Component, using the OS's (free) codec extensions.
 Animated GIF, WebP and APNG play in the viewer and preview. HDR/EXR are tone-mapped (auto exposure +
-ACES) with a live exposure slider.
+ACES) with a live exposure slider, and can be viewed as a mirror sphere or a 360° panorama.
+
+**Hardware JPEG decoding:** large baseline 4:2:0 photos opened in the viewer decode on the graphics
+card's JPEG engine (the Media Foundation MJPEG decoders AMD, NVIDIA and Intel drivers install), about
+2.5× faster than the CPU for a 24 MP photo, with output matching the CPU decoder to within rounding.
+Other JPEGs and all thumbnails use the multi-threaded CPU path. Switch it off in Settings → Viewer.
+Benchmark: `CYCLOPS_BENCH_DIR=<folder> cargo test --release bench_viewer_jpeg -- --ignored --nocapture`.
 
 **Video** (mp4, mov, mkv, wmv, avi, webm, …) plays through Windows Media Foundation: the OS codecs
 decode on the GPU, so Cyclops bundles no codecs and carries no codec licensing obligations.

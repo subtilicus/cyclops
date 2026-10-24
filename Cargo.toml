@@ -11,7 +11,7 @@ categories = ["multimedia::images", "graphics"]
 
 [dependencies]
 bcdec_rs = "0.2.0"
-bytemuck = { version = "1.25.2", features = ["derive"] }
+bytemuck = { version = "1.25.2", features = ["derive", "extern_crate_alloc"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 crossbeam-channel = "0.5.17"
 ddsfile = "0.6.0"

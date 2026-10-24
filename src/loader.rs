@@ -173,7 +173,9 @@ fn worker(
         }
         let full = job.kind == Kind::Full;
         let vector_side = if full { job.screen_side.max(1024) } else { job.max_side };
+        let mut decode_ms = 0.0;
         let result = decode::decode(&job.path, job.max_side, vector_side, full).map(|d| {
+            decode_ms = start.elapsed().as_secs_f32() * 1000.0;
             let source_size = [d.source_size[0] as usize, d.source_size[1] as usize];
             let frames: Vec<(ColorImage, f32)> = d
                 .frames
@@ -186,7 +188,7 @@ fn worker(
                     let longest = main_img.width().max(main_img.height());
                     // Only worth it when the image is substantially larger than the screen.
                     (longest as f32 > job.screen_side as f32 * 1.5)
-                        .then(|| to_color_image(decode::fit_within(main_img.clone(), job.screen_side), d.opaque))
+                        .then(|| to_color_image(decode::downscaled(&main_img, job.screen_side), d.opaque))
                 })
                 .flatten();
             let main = to_color_image(main_img, d.opaque);
@@ -209,8 +211,8 @@ fn worker(
         });
         crate::perflog::record(|| match &result {
             Ok(img) => format!(
-                "{:?}  {:>8.1} ms  {}x{}  {}",
-                job.kind, img.decode_ms, img.source_size[0], img.source_size[1], job.path.display()
+                "{:?}  {:>8.1} ms  (decode {:>6.1})  {}x{}  {}",
+                job.kind, img.decode_ms, decode_ms, img.source_size[0], img.source_size[1], job.path.display()
             ),
             Err(e) => format!("{:?}  failed: {e}  {}", job.kind, job.path.display()),
         });
@@ -224,7 +226,11 @@ fn worker(
 fn to_color_image(img: image::RgbaImage, opaque: bool) -> ColorImage {
     let size = [img.width() as usize, img.height() as usize];
     if opaque {
-        ColorImage::from_rgba_premultiplied(size, img.as_raw())
+        // Opaque pixels are already premultiplied: reuse the buffer instead of copying it.
+        match bytemuck::allocation::try_cast_vec::<u8, egui::Color32>(img.into_raw()) {
+            Ok(pixels) => ColorImage::new(size, pixels),
+            Err((_, raw)) => ColorImage::from_rgba_premultiplied(size, &raw),
+        }
     } else {
         ColorImage::from_rgba_unmultiplied(size, img.as_raw())
     }

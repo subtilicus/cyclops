@@ -142,7 +142,7 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
     }
     if is_jpeg(path) {
         // Some files have a .jpg extension but are something else; fall back to `image`.
-        if let Ok(d) = decode_jpeg(&bytes) {
+        if let Ok(d) = decode_jpeg(&bytes, animate) {
             return Ok(d);
         }
     }
@@ -467,7 +467,15 @@ fn decode_psd(bytes: &[u8]) -> Result<Decoded, String> {
     Ok(Decoded { bit_depth: Some(BitDepth { bits, float: bits == 32 }), ..Decoded::still(image, opaque) })
 }
 
-fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
+/// `full`: a viewer image, which may use the GPU's JPEG decoder (see `hwjpeg`).
+fn decode_jpeg(bytes: &[u8], full: bool) -> Result<Decoded, String> {
+    // Large baseline 4:2:0 photos go to the GPU's JPEG decoder when one is free.
+    if let Some(header) = crate::hwjpeg::header(bytes).filter(|_| full) {
+        if let Some(image) = crate::hwjpeg::decode(bytes, &header) {
+            let orientation = header.exif(bytes).and_then(exif_orientation).unwrap_or(1);
+            return Ok(Decoded { bit_depth: Some(BitDepth::EIGHT), ..Decoded::still(apply_orientation(image, orientation), true) });
+        }
+    }
     let options = DecoderOptions::default()
         .jpeg_set_out_colorspace(ColorSpace::RGBA)
         .set_max_width(u16::MAX as usize)
@@ -488,10 +496,70 @@ pub fn fit_within(image: RgbaImage, max_side: u32) -> RgbaImage {
     if w <= max_side && h <= max_side {
         return image;
     }
+    downscaled(&image, max_side)
+}
+
+/// A copy scaled down so that neither side exceeds `max_side` (a plain copy if it already fits).
+///
+/// Exact area averaging: every output pixel is the mean of the source area it covers, with
+/// partially covered pixels weighted by coverage, so non-integer ratios stay even. Rows are
+/// done in parallel, each from its few source rows, so no full-size intermediate is needed.
+pub fn downscaled(image: &RgbaImage, max_side: u32) -> RgbaImage {
+    use rayon::prelude::*;
+    let (w, h) = image.dimensions();
+    if w <= max_side && h <= max_side {
+        return image.clone();
+    }
     let scale = max_side as f32 / w.max(h) as f32;
-    let nw = ((w as f32 * scale).round() as u32).max(1);
-    let nh = ((h as f32 * scale).round() as u32).max(1);
-    image::imageops::thumbnail(&image, nw, nh)
+    let nw = ((w as f32 * scale).round() as u32).clamp(1, w);
+    let nh = ((h as f32 * scale).round() as u32).clamp(1, h);
+    let (xs, ys) = (box_weights(w as usize, nw as usize), box_weights(h as usize, nh as usize));
+    let (sw, src) = (w as usize * 4, image.as_raw());
+    let mut out = vec![0u8; nw as usize * nh as usize * 4];
+    out.par_chunks_mut(nw as usize * 4).zip(ys.par_iter()).for_each_init(
+        || vec![0f32; sw],
+        |acc, (dst, (y0, wy))| {
+            // Vertical: weighted sum of this output row's source rows.
+            acc.fill(0.0);
+            for (k, &weight) in wy.iter().enumerate() {
+                let row = &src[(y0 + k) * sw..(y0 + k + 1) * sw];
+                for (a, &v) in acc.iter_mut().zip(row) {
+                    *a += v as f32 * weight;
+                }
+            }
+            // Horizontal.
+            for (x, (x0, wx)) in xs.iter().enumerate() {
+                let mut px = [0f32; 4];
+                for (k, &weight) in wx.iter().enumerate() {
+                    let s = &acc[(x0 + k) * 4..(x0 + k) * 4 + 4];
+                    for c in 0..4 {
+                        px[c] += s[c] * weight;
+                    }
+                }
+                for c in 0..4 {
+                    dst[x * 4 + c] = (px[c] + 0.5).clamp(0.0, 255.0) as u8;
+                }
+            }
+        },
+    );
+    RgbaImage::from_raw(nw, nh, out).expect("buffer size")
+}
+
+/// For each of `dst` output samples: the first source sample it covers and the weight of each
+/// covered source sample (summing to 1).
+fn box_weights(src: usize, dst: usize) -> Vec<(usize, Vec<f32>)> {
+    let ratio = src as f64 / dst as f64;
+    (0..dst)
+        .map(|i| {
+            let (a, b) = (i as f64 * ratio, ((i + 1) as f64 * ratio).min(src as f64));
+            let first = a.floor() as usize;
+            let last = (b.ceil() as usize).clamp(first + 1, src);
+            let weights = (first..last)
+                .map(|j| ((b.min(j as f64 + 1.0) - a.max(j as f64)) / ratio) as f32)
+                .collect();
+            (first, weights)
+        })
+        .collect()
 }
 
 fn apply_orientation<P: image::Pixel + 'static>(
@@ -533,4 +601,47 @@ fn exif_orientation(exif: &[u8]) -> Option<u16> {
         let entry = ifd + 2 + i * 12;
         (u16_at(entry)? == 0x0112).then(|| u16_at(entry + 8)).flatten()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    /// Full-size decodes of every JPEG in `CYCLOPS_BENCH_DIR`, one after another like flipping
+    /// through photos in the viewer, on the CPU and then on the GPU's JPEG decoder:
+    /// `CYCLOPS_BENCH_DIR=<folder> cargo test --release bench_viewer_jpeg -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_viewer_jpeg() {
+        let dir = std::env::var("CYCLOPS_BENCH_DIR").expect("set CYCLOPS_BENCH_DIR to a folder of JPEGs");
+        let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().filter_map(|e| Some(e.ok()?.path())).filter(|p| super::is_jpeg(p)).collect();
+        files.sort();
+        assert!(!files.is_empty(), "no JPEGs");
+        crate::hwjpeg::warm_up();
+        let started = Instant::now();
+        while crate::hwjpeg::status() == "Starting…" && started.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        println!("hardware decoder: {} (ready after {:.0} ms)", crate::hwjpeg::status(), started.elapsed().as_secs_f64() * 1e3);
+        for hw in [false, true, false, true] {
+            crate::hwjpeg::set_enabled(hw);
+            let (mut decode, mut screen) = (Duration::ZERO, Duration::ZERO);
+            for f in &files {
+                let t = Instant::now();
+                let d = super::decode(f, 16384, 1024, true).unwrap();
+                decode += t.elapsed();
+                let t = Instant::now();
+                std::hint::black_box(super::downscaled(&d.image, 2560));
+                screen += t.elapsed();
+            }
+            let n = files.len() as f64;
+            println!(
+                "{}: decode {:.1} ms, screen copy {:.1} ms per image ({} files)",
+                if hw { "GPU" } else { "CPU" },
+                decode.as_secs_f64() * 1e3 / n,
+                screen.as_secs_f64() * 1e3 / n,
+                files.len()
+            );
+        }
+    }
 }
