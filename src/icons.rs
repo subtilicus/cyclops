@@ -18,6 +18,9 @@ pub enum Icon {
     Grid,
     Warning,
     Cog,
+    Image,
+    Sphere,
+    Globe,
     Close,
     TwoPane,
     ThreePane,
@@ -89,6 +92,35 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Close => {
             line(&[p(4.0, 4.0), p(12.0, 12.0)]);
             line(&[p(12.0, 4.0), p(4.0, 12.0)]);
+        }
+        Icon::Image => {
+            let r = Rect::from_min_max(p(1.5, 3.0), p(14.5, 13.0));
+            painter.rect_stroke(r, CornerRadius::same((2.0 * s) as u8), stroke, egui::StrokeKind::Middle);
+            line(&[p(3.5, 11.0), p(7.0, 7.0), p(9.5, 9.5), p(11.0, 8.0), p(12.5, 11.0)]);
+            painter.circle_filled(p(11.0, 5.6), 1.0 * s, color);
+        }
+        Icon::Sphere => {
+            painter.circle_stroke(p(8.0, 8.0), 6.2 * s, stroke);
+            painter.circle_filled(p(5.6, 5.6), 1.6 * s, color);
+            let arc: Vec<Pos2> = (0..=12)
+                .map(|i| {
+                    let a = (100.0 + i as f32 * 7.0f32).to_radians();
+                    p(8.0, 8.0) + 4.4 * s * Vec2::angled(a)
+                })
+                .collect();
+            painter.add(Shape::line(arc, Stroke::new(stroke.width * 0.8, color.gamma_multiply(0.7))));
+        }
+        Icon::Globe => {
+            let c = p(8.0, 8.0);
+            painter.circle_stroke(c, 6.2 * s, stroke);
+            line(&[p(1.8, 8.0), p(14.2, 8.0)]);
+            let meridian: Vec<Pos2> = (0..=20)
+                .map(|i| {
+                    let a = (i as f32 / 20.0) * std::f32::consts::TAU;
+                    c + vec2(2.8 * a.cos(), 6.2 * a.sin()) * s
+                })
+                .collect();
+            painter.add(Shape::line(meridian, stroke));
         }
         Icon::Cog => {
             let c = p(8.0, 8.0);

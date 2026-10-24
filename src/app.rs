@@ -165,6 +165,8 @@ impl FullImage {
 
 struct HdrEdit {
     gpu: crate::hdr_gpu::HdrTexture,
+    /// Flat image, mirror sphere or panorama, and the camera for the latter two.
+    view: crate::hdr_gpu::EnvView,
     auto_exposure: f32,
     /// ACES tone mapping (scene-referred) vs plain clipping (display-referred).
     tonemap: bool,
@@ -910,7 +912,7 @@ impl CyclopsApp {
                                             main: ctx.load_texture(format!("{name}#sub{i}"), sub.main, TextureOptions::LINEAR),
                                             hdr: sub.hdr.zip(self.render_state.as_ref()).and_then(|(hdr, rs)| {
                                                 let gpu = crate::hdr_gpu::upload(rs, &hdr.levels)?;
-                                                Some(HdrEdit { gpu, auto_exposure: hdr.auto_exposure, tonemap: hdr.tonemap, ev: 0.0 })
+                                                Some(HdrEdit { gpu, view: Default::default(), auto_exposure: hdr.auto_exposure, tonemap: hdr.tonemap, ev: 0.0 })
                                             }),
                                             size: vec2(sub.size[0] as f32, sub.size[1] as f32),
                                         }))
@@ -923,7 +925,7 @@ impl CyclopsApp {
                                 paused_at: None,
                                 hdr: images.hdr.zip(self.render_state.as_ref()).and_then(|(hdr, rs)| {
                                     let gpu = crate::hdr_gpu::upload(rs, &hdr.levels)?;
-                                    Some(HdrEdit { gpu, auto_exposure: hdr.auto_exposure, tonemap: hdr.tonemap, ev: 0.0 })
+                                    Some(HdrEdit { gpu, view: Default::default(), auto_exposure: hdr.auto_exposure, tonemap: hdr.tonemap, ev: 0.0 })
                                 }),
                                 main: main_tex,
                                 screen: images
@@ -1934,6 +1936,7 @@ impl CyclopsApp {
 
         // Ctrl+wheel always zooms; the plain wheel follows the setting.
         let (wheel_plain, wheel_ctrl, pinch) = wheel_input(&ctx, resp.hovered());
+        let env_active = self.env_input(&resp, &entry.path, wheel_plain + wheel_ctrl);
         let (wheel, wheel_nav) =
             if self.settings.wheel_zooms { (wheel_plain + wheel_ctrl, 0.0) } else { (wheel_ctrl, wheel_plain) };
 
@@ -1947,6 +1950,10 @@ impl CyclopsApp {
             let factor = wheel_zoom_factor(wheel) * pinch * self.pending_key_zoom;
             let focus = if wheel != 0.0 || pinch != 1.0 { resp.hover_pos().unwrap_or(rect.center()) } else { rect.center() };
             let (draw, scale) = v.view.update(&ctx, rect, &resp, natural, fit, factor, focus, source_size.is_some());
+            if env_active {
+                // The flat view stays at fit while looking around in 3D.
+                v.view = ZoomPan::default();
+            }
             let size = draw.size();
             zoom_pct = Some(scale * ppp * 100.0);
 
@@ -1970,6 +1977,9 @@ impl CyclopsApp {
                 },
             };
             let hdr_shape = match self.full.get(&entry.path) {
+                Some(Full::Ready(FullImage { hdr: Some(h), .. })) if h.view.mode != crate::hdr_gpu::EnvMode::Flat => {
+                    h.gpu.paint_env(rect, h.exposure(), h.tonemap, h.view, ppp)
+                }
                 Some(Full::Ready(FullImage { hdr: Some(h), .. })) => h.gpu.paint(draw, rect, h.exposure(), h.tonemap),
                 _ => None,
             };
@@ -2137,8 +2147,12 @@ impl CyclopsApp {
                 let (plain, ctrl, pinch) = wheel_input(ui.ctx(), resp.hovered());
                 let factor = wheel_zoom_factor(plain + ctrl) * pinch;
                 let focus = resp.hover_pos().unwrap_or(img_rect.center());
+                let env_active = self.env_input(&resp, &entry.path, plain + ctrl);
                 let (draw, _) =
                     self.preview_view.update(ui.ctx(), img_rect, &resp, natural, fit, factor, focus, full.is_some());
+                if env_active {
+                    self.preview_view = ZoomPan::default();
+                }
                 let tex = match &full {
                     Some((.., Some(frame))) => *frame,
                     Some((_, main, screen, None)) => match screen {
@@ -2148,6 +2162,9 @@ impl CyclopsApp {
                     None => thumb.as_ref().map_or(egui::TextureId::default(), |t| t.id()),
                 };
                 let hdr_shape = match self.full.get(&entry.path) {
+                    Some(Full::Ready(FullImage { hdr: Some(h), .. })) if h.view.mode != crate::hdr_gpu::EnvMode::Flat => {
+                        h.gpu.paint_env(img_rect, h.exposure(), h.tonemap, h.view, ppp)
+                    }
                     Some(Full::Ready(FullImage { hdr: Some(h), .. })) => h.gpu.paint(draw, img_rect, h.exposure(), h.tonemap),
                     _ => None,
                 };
@@ -2895,6 +2912,34 @@ impl CyclopsApp {
         }
     }
 
+    /// Sphere / panorama camera control: drag rotates, the wheel changes field of view.
+    /// Returns whether a 3D view is active (so the flat pan/zoom should be ignored).
+    fn env_input(&mut self, resp: &egui::Response, path: &Path, wheel: f32) -> bool {
+        use crate::hdr_gpu::EnvMode;
+        let Some(Full::Ready(FullImage { hdr: Some(h), .. })) = self.full.get_mut(path) else { return false };
+        if h.view.mode == EnvMode::Flat {
+            return false;
+        }
+        if resp.dragged() {
+            let d = resp.drag_delta();
+            // Scale with the field of view so dragging feels like grabbing the scene.
+            let k = h.view.fov.to_radians() / resp.rect.height().max(1.0);
+            h.view.yaw -= d.x * k;
+            if h.view.mode == EnvMode::Panorama {
+                h.view.pitch = (h.view.pitch + d.y * k).clamp(-1.55, 1.55);
+            } else {
+                h.view.pitch = (h.view.pitch + d.y * k).clamp(-1.2, 1.2);
+            }
+        }
+        if wheel != 0.0 && h.view.mode == EnvMode::Panorama {
+            h.view.fov = (h.view.fov * (-wheel * 0.0015).exp()).clamp(15.0, 130.0);
+        }
+        if resp.hovered() {
+            resp.ctx.set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+        }
+        true
+    }
+
     /// Glass exposure slider for HDR/EXR images, at the top of `area`.
     fn exposure_control(&mut self, ui: &mut egui::Ui, area: Rect, path: &Path) {
         // ±8 EV: 16 stops around auto exposure.
@@ -2902,12 +2947,13 @@ impl CyclopsApp {
         let Some(Full::Ready(FullImage { hdr: Some(hdr), .. })) = self.full.get_mut(path) else { return };
         let painter = ui.painter().clone();
         let fg = theme::DARK.text;
-        let pill = Rect::from_center_size(pos2(area.center().x, area.min.y + 30.0), vec2(480.0_f32.min(area.width() - 24.0), 36.0));
+        let views: f32 = if hdr.tonemap { 104.0 } else { 0.0 };
+        let pill = Rect::from_center_size(pos2(area.center().x, area.min.y + 30.0), vec2((480.0 + views).min(area.width() - 24.0), 36.0));
         crate::glass::paint(&painter, pill, 12.0, self.backdrop);
         let cy = pill.center().y;
         painter.text(pos2(pill.min.x + 14.0, cy), Align2::LEFT_CENTER, "Exposure", FontId::proportional(12.5), fg);
 
-        let track = Rect::from_min_max(pos2(pill.min.x + 88.0, cy - 2.5), pos2(pill.max.x - 124.0, cy + 2.5));
+        let track = Rect::from_min_max(pos2(pill.min.x + 88.0, cy - 2.5), pos2(pill.max.x - 124.0 - views, cy + 2.5));
         let resp = ui.interact(track.expand2(vec2(8.0, 12.0)), ui.scope_id().with(("exposure", path)), Sense::click_and_drag());
         if resp.double_clicked() {
             hdr.ev = 0.0;
@@ -2937,7 +2983,7 @@ impl CyclopsApp {
         painter.circle_filled(pos2(knob_x, cy), if resp.hovered() || resp.dragged() { 7.0 } else { 5.5 }, Color32::WHITE);
         painter.text(pos2(track.max.x + 12.0, cy), Align2::LEFT_CENTER, format!("{:+.2} EV", hdr.ev), FontId::monospace(12.0), fg);
 
-        let auto = Rect::from_center_size(pos2(pill.max.x - 28.0, cy), vec2(44.0, 24.0));
+        let auto = Rect::from_center_size(pos2(pill.max.x - 28.0 - views, cy), vec2(44.0, 24.0));
         let auto_resp = ui.interact(auto, ui.scope_id().with(("exposure-auto", path)), Sense::click());
         if auto_resp.hovered() {
             painter.rect_filled(auto, CornerRadius::same(6), Color32::from_white_alpha(24));
@@ -2945,6 +2991,26 @@ impl CyclopsApp {
         painter.text(auto.center(), Align2::CENTER_CENTER, "Auto", FontId::proportional(12.0), if hdr.ev == 0.0 { theme::DARK.text_dim } else { fg });
         if auto_resp.clicked() {
             hdr.ev = 0.0;
+        }
+        if hdr.tonemap {
+            use crate::hdr_gpu::EnvMode;
+            painter.vline(pill.max.x - views - 2.0, (cy - 10.0)..=(cy + 10.0), Stroke::new(1.0, Color32::from_white_alpha(40)));
+            let modes = [(EnvMode::Flat, Icon::Image, "Flat image"), (EnvMode::Sphere, Icon::Sphere, "Mirror sphere"), (EnvMode::Panorama, Icon::Globe, "Look around (360° environment)")];
+            for (i, (mode, icon, tip)) in modes.into_iter().enumerate() {
+                let r = Rect::from_center_size(pos2(pill.max.x - views + 16.0 + i as f32 * 30.0, cy), vec2(26.0, 26.0));
+                let resp = ui.interact(r, ui.scope_id().with(("env-mode", path, i)), Sense::click()).on_hover_text(tip);
+                let active = hdr.view.mode == mode;
+                if active {
+                    painter.rect_filled(r, CornerRadius::same(6), theme::DARK.accent.gamma_multiply(0.35));
+                } else if resp.hovered() {
+                    painter.rect_filled(r, CornerRadius::same(6), Color32::from_white_alpha(24));
+                }
+                let color = if active { Color32::WHITE } else { fg };
+                icons::paint(&painter, r.shrink(5.0), icon, color);
+                if resp.clicked() {
+                    hdr.view.mode = mode;
+                }
+            }
         }
 
     }
