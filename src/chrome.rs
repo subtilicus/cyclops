@@ -89,6 +89,38 @@ mod imp {
             set(hwnd, DWMWA_TEXT_COLOR, &colorref(text));
             set(hwnd, DWMWA_BORDER_COLOR, &colorref(border));
         }
+        static ICON: std::sync::Once = std::sync::Once::new();
+        ICON.call_once(|| set_icon(hwnd));
+    }
+
+    /// Give the window the exe's embedded icon (its hand-tuned 16-32 px frames, at the window's
+    /// DPI) and redraw the frame: an icon set after the caption is first drawn otherwise doesn't
+    /// show until something else repaints it.
+    fn set_icon(hwnd: HWND) {
+        use windows::Win32::Foundation::{HINSTANCE, LPARAM, WPARAM};
+        use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        use windows::core::PCWSTR;
+        unsafe {
+            let module = HINSTANCE(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE) as *mut _);
+            let dpi = GetDpiForWindow(hwnd).max(96);
+            for (kind, metric) in [(ICON_SMALL, SM_CXSMICON), (ICON_BIG, SM_CXICON)] {
+                let side = GetSystemMetricsForDpi(metric, dpi);
+                // Resource 1 is the icon build.rs embeds.
+                if let Ok(icon) = LoadImageW(Some(module), PCWSTR(1 as _), IMAGE_ICON, side, side, LR_DEFAULTCOLOR) {
+                    SendMessageW(hwnd, WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(icon.0 as isize)));
+                }
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
     }
 }
 

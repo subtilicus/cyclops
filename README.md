@@ -1,3 +1,5 @@
+<img src="assets/icon_256.png" width="128" alt="Cyclops icon">
+
 # Cyclops
 
 **A blazing-fast, GPU-accelerated image browser written in Rust — built to displace FastStone.**

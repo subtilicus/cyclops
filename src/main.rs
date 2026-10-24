@@ -50,6 +50,17 @@ fn main() -> eframe::Result {
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
+    // Windows takes the icon from the exe's resources (see `chrome::style`). An empty icon keeps
+    // eframe from setting its default egui logo over it later.
+    #[cfg(windows)]
+    let options = eframe::NativeOptions { viewport: options.viewport.with_icon(egui::IconData::default()), ..options };
+    #[cfg(not(windows))]
+    let options = eframe::NativeOptions {
+        viewport: options.viewport.with_icon(std::sync::Arc::new(
+            eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon_256.png")).expect("bundled icon"),
+        )),
+        ..options
+    };
     eframe::run_native(
         "Cyclops",
         options,
