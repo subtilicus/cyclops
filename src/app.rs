@@ -526,6 +526,7 @@ impl CyclopsApp {
         crate::hwjpeg::set_enabled(settings.hw_jpeg);
         if let Some(rs) = &cc.wgpu_render_state {
             crate::hdr_gpu::init(rs);
+            crate::about_fx::init(rs);
             let info = rs.adapter.get_info();
             log::info!("adapter: {} ({:?}, {:?}), target format {:?}", info.name, info.backend, info.device_type, rs.target_format);
         }
@@ -1325,17 +1326,32 @@ impl CyclopsApp {
     fn settings_about(&mut self, ui: &mut egui::Ui) {
         let p = theme::p();
         const REPO: &str = env!("CARGO_PKG_REPOSITORY");
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
-            app_mark(ui.painter(), rect, p.accent);
-            ui.add_space(14.0);
-            ui.vertical(|ui| {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Cyclops Image Browser").size(20.0).color(p.text_strong));
-                ui.label(egui::RichText::new(concat!("Version ", env!("CARGO_PKG_VERSION"))).size(13.0).color(p.text_dim));
-            });
-        });
-        ui.add_space(12.0);
+        // Banner: an animated ring (a shader) with the name below. It stays dark in both skins,
+        // since the ring is light added onto it.
+        let (banner, _) = ui.allocate_exact_size(vec2(ui.available_width(), 196.0), Sense::hover());
+        let painter = ui.painter_at(banner);
+        painter.rect_filled(banner, CornerRadius::same(12), Color32::from_rgb(6, 8, 12));
+        let ring = pos2(banner.center().x, banner.min.y + 78.0);
+        if self.render_state.is_some() {
+            let time = ui.input(|i| i.time) as f32;
+            painter.add(crate::about_fx::paint(banner, ring, 170.0, 12.0, time, ui.ctx().pixels_per_point()));
+            ui.ctx().request_repaint();
+        }
+        painter.text(
+            pos2(banner.center().x, banner.max.y - 44.0),
+            Align2::CENTER_CENTER,
+            "Cyclops Image Browser",
+            FontId::proportional(21.0),
+            Color32::WHITE,
+        );
+        painter.text(
+            pos2(banner.center().x, banner.max.y - 20.0),
+            Align2::CENTER_CENTER,
+            concat!("Version ", env!("CARGO_PKG_VERSION")),
+            FontId::proportional(12.5),
+            Color32::from_white_alpha(150),
+        );
+        ui.add_space(14.0);
         ui.label(egui::RichText::new(env!("CARGO_PKG_DESCRIPTION")).size(13.0).color(p.text));
         ui.add_space(16.0);
 
@@ -2515,29 +2531,6 @@ impl CyclopsApp {
 fn video_badge(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
     painter.circle(center, radius, Color32::from_black_alpha(160), Stroke::new(1.0, Color32::from_white_alpha(60)));
     icons::paint(painter, Rect::from_center_size(center, Vec2::splat(radius * 1.1)), Icon::Play, Color32::WHITE);
-}
-
-/// Cyclops's mark: a single eye in a rounded tile.
-fn app_mark(painter: &egui::Painter, rect: Rect, accent: Color32) {
-    painter.rect_filled(rect, CornerRadius::same(16), Color32::from_rgb(18, 22, 30));
-    painter.rect_stroke(rect, CornerRadius::same(16), Stroke::new(1.0, Color32::from_white_alpha(30)), egui::StrokeKind::Inside);
-    let c = rect.center();
-    let w = rect.width() * 0.36;
-    // Almond-shaped eye outline from two arcs.
-    let lid = |sign: f32| -> Vec<egui::Pos2> {
-        (0..=24)
-            .map(|i| {
-                let t = i as f32 / 24.0 * std::f32::consts::PI;
-                pos2(c.x - w * t.cos(), c.y + sign * w * 0.62 * t.sin())
-            })
-            .collect()
-    };
-    let stroke = Stroke::new(2.4, Color32::from_white_alpha(220));
-    painter.add(egui::Shape::line(lid(-1.0), stroke));
-    painter.add(egui::Shape::line(lid(1.0), stroke));
-    painter.circle_filled(c, w * 0.5, accent);
-    painter.circle_filled(c, w * 0.22, Color32::from_rgb(10, 12, 16));
-    painter.circle_filled(c + vec2(-w * 0.16, -w * 0.16), w * 0.08, Color32::from_white_alpha(230));
 }
 
 /// A settings row: title and optional description on the left, the control on the right.
