@@ -645,3 +645,59 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod raw_survey {
+    use std::time::Instant;
+
+    /// Tries every file under `CYCLOPS_RAW_DIR` through WIC (whatever its extension) and reports
+    /// what decodes: `CYCLOPS_RAW_DIR=<folder> cargo test --release raw_survey -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn raw_survey() {
+        let dir = std::env::var("CYCLOPS_RAW_DIR").expect("set CYCLOPS_RAW_DIR");
+        let mut files = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if !p.ends_with(".git") {
+                        stack.push(p);
+                    }
+                } else if p.metadata().is_ok_and(|m| m.len() > 4096) {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        let (mut ok, mut failed) = (0, 0);
+        for f in &files {
+            if std::env::var_os("CYCLOPS_RAW_DESCRIBE").is_some() {
+                println!("{}  {}", crate::wic::describe(f), f.file_name().unwrap().to_string_lossy());
+                continue;
+            }
+            let t = Instant::now();
+            let listed = crate::wic::handles(f);
+            match crate::wic::decode(f, 512, false) {
+                Ok(img) => {
+                    ok += 1;
+                    println!(
+                        "OK   {:>7.0} ms  {:>5}x{:<5} {:>2}-bit {}  {}",
+                        t.elapsed().as_secs_f64() * 1e3,
+                        img.source_size[0],
+                        img.source_size[1],
+                        img.bits,
+                        if listed { "      " } else { "UNLIST" },
+                        f.display()
+                    );
+                }
+                Err(e) => {
+                    failed += 1;
+                    println!("FAIL {} {}  {e}", if listed { "      " } else { "UNLIST" }, f.display());
+                }
+            }
+        }
+        println!("{ok} decoded, {failed} failed");
+    }
+}

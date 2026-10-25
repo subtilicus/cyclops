@@ -8,15 +8,24 @@ use image::RgbaImage;
 pub const EXTENSIONS: &[&str] = &[
     // HEIF family, AV1, JPEG XL / XR
     "heic", "heif", "hif", "avif", "jxl", "jxr", "wdp", "hdp",
-    // Camera RAW (decoded by the Microsoft Raw Image Extension) and DNG
-    "dng", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "raf", "orf", "rw2", "pef", "srw", "x3f",
-    "erf", "kdc", "dcr", "mrw", "3fr", "iiq", "rwl",
 ];
 
+/// Camera RAW and DNG, decoded by Microsoft's Raw Image Decoder (the free Raw Image Extension).
+pub const RAW_EXTENSIONS: &[&str] = &[
+    "dng", "cr2", "cr3", "crw", "nef", "nrw", "arw", "arq", "srf", "sr2", "raf", "orf", "ori", "rw2", "rwl",
+    "pef", "srw", "x3f", "erf", "kdc", "dcr", "mrw", "3fr", "fff", "iiq", "mef", "mos", "sti", "gpr",
+];
+
+fn has_extension(path: &Path, list: &[&str]) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| list.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
 pub fn handles(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+    has_extension(path, EXTENSIONS) || is_camera_raw(path)
+}
+
+pub fn is_camera_raw(path: &Path) -> bool {
+    has_extension(path, RAW_EXTENSIONS)
 }
 
 pub struct WicImage {
@@ -38,6 +47,11 @@ pub fn decode(path: &Path, max_side: u32, want_linear: bool) -> Result<WicImage,
     imp::decode(path, max_side, want_linear).map_err(|e| format!("WIC: {e}"))
 }
 
+#[cfg(all(test, windows))]
+pub fn describe(path: &Path) -> String {
+    imp::describe(path)
+}
+
 #[cfg(windows)]
 mod imp {
     use std::path::Path;
@@ -47,6 +61,7 @@ mod imp {
     use windows::Win32::Graphics::Imaging::*;
     use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx};
+    use windows::core::GUID;
     use windows::Win32::System::Variant::VT_UI2;
     use windows::core::{HSTRING, Interface, w};
 
@@ -71,6 +86,55 @@ mod imp {
         }
     }
 
+    /// Microsoft's Raw Image Decoder, found by the formats it declares (so it works in any
+    /// language). `None` when the Raw Image Extension isn't installed.
+    fn raw_decoder(factory: &IWICImagingFactory) -> Option<GUID> {
+        static CLSID: std::sync::OnceLock<Option<GUID>> = std::sync::OnceLock::new();
+        *CLSID.get_or_init(|| unsafe {
+            let all = factory.CreateComponentEnumerator(WICDecoder.0 as u32, WICComponentEnumerateDefault.0 as u32).ok()?;
+            loop {
+                let mut item = [None];
+                let mut fetched = 0;
+                if all.Next(&mut item, Some(&mut fetched)).is_err() || fetched == 0 {
+                    return None;
+                }
+                let Some(Ok(info)) = item[0].take().map(|u| u.cast::<IWICBitmapCodecInfo>()) else { continue };
+                let mut buf = vec![0u16; 4096];
+                let mut len = 0;
+                if info.GetFileExtensions(&mut buf, &mut len).is_err() {
+                    continue;
+                }
+                let extensions = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]).to_ascii_lowercase();
+                if extensions.contains(".nef") && extensions.contains(".cr3") {
+                    return info.GetCLSID().ok();
+                }
+            }
+        })
+    }
+
+    /// Camera RAW goes to the Raw Image Decoder explicitly: left to choose, Windows hands many
+    /// DNGs to its older DNG decoder and IIQ/MEF to the TIFF decoder, which only return the
+    /// small embedded preview. Anything that decoder can't open falls back to Windows' choice.
+    unsafe fn open(factory: &IWICImagingFactory, path: &Path) -> windows::core::Result<IWICBitmapDecoder> {
+        unsafe {
+            if super::is_camera_raw(path) {
+                if let Some(clsid) = raw_decoder(factory) {
+                    let raw = || -> windows::core::Result<IWICBitmapDecoder> {
+                        let decoder: IWICBitmapDecoder = CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER)?;
+                        let stream = factory.CreateStream()?;
+                        stream.InitializeFromFilename(&HSTRING::from(path.as_os_str()), GENERIC_READ.0)?;
+                        decoder.Initialize(&stream, WICDecodeMetadataCacheOnDemand)?;
+                        Ok(decoder)
+                    };
+                    if let Ok(decoder) = raw() {
+                        return Ok(decoder);
+                    }
+                }
+            }
+            factory.CreateDecoderFromFilename(&HSTRING::from(path.as_os_str()), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
+        }
+    }
+
     /// Bits per channel and float-ness of a WIC pixel format.
     fn depth(factory: &IWICImagingFactory, format: &windows::core::GUID) -> Option<(u8, bool)> {
         unsafe {
@@ -82,16 +146,50 @@ mod imp {
         }
     }
 
+    /// Decoder, frames and pixel formats of a file (survey test diagnostics).
+    #[cfg(test)]
+    pub fn describe(path: &Path) -> String {
+        fn name(info: windows::core::Result<IWICComponentInfo>) -> String {
+            unsafe {
+                let Ok(info) = info else { return "?".into() };
+                let mut buf = [0u16; 128];
+                let mut len = 0;
+                let _ = info.GetFriendlyName(&mut buf, &mut len);
+                String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)])
+            }
+        }
+        FACTORY.with(|factory| unsafe {
+            let Some(factory) = factory.as_ref() else { return "no factory".into() };
+            let decoder = match open(factory, path) {
+                Ok(d) => d,
+                Err(e) => return format!("no decoder: {e}"),
+            };
+            let codec = decoder.GetDecoderInfo().map(|i| name(i.cast())).unwrap_or_default();
+            let count = decoder.GetFrameCount().unwrap_or(0);
+            let mut out = format!("{codec}, {count} frame(s):");
+            for i in 0..count {
+                if let Ok(frame) = decoder.GetFrame(i) {
+                    let (mut w, mut h) = (0, 0);
+                    let _ = frame.GetSize(&mut w, &mut h);
+                    let format = frame.GetPixelFormat().map(|f| name(factory.CreateComponentInfo(&f))).unwrap_or_default();
+                    let develop = if frame.cast::<IWICDevelopRaw>().is_ok() { " develop-raw" } else { "" };
+                    out += &format!(" [{w}x{h} {format}{develop}]");
+                }
+            }
+            if let Ok(preview) = decoder.GetPreview() {
+                let (mut w, mut h) = (0, 0);
+                let _ = preview.GetSize(&mut w, &mut h);
+                out += &format!(" preview {w}x{h}");
+            }
+            out
+        })
+    }
+
     pub fn decode(path: &Path, max_side: u32, want_linear: bool) -> windows::core::Result<WicImage> {
         FACTORY.with(|factory| {
             let factory = factory.as_ref().ok_or_else(windows::core::Error::empty)?;
             unsafe {
-                let decoder = factory.CreateDecoderFromFilename(
-                    &HSTRING::from(path.as_os_str()),
-                    None,
-                    GENERIC_READ,
-                    WICDecodeMetadataCacheOnDemand,
-                )?;
+                let decoder = open(factory, path)?;
                 let frame = decoder.GetFrame(0)?;
                 let (mut w, mut h) = (0u32, 0u32);
                 frame.GetSize(&mut w, &mut h)?;
