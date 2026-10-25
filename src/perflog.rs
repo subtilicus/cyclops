@@ -51,6 +51,31 @@ pub fn set_enabled(on: bool) {
     }
 }
 
+/// Milliseconds since the process was created, so startup marks include loading the exe and
+/// its DLLs before `main`.
+pub fn since_launch_ms() -> f64 {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        let ticks = |t: FILETIME| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64;
+        let (mut created, mut exit, mut kernel, mut user) = Default::default();
+        if GetProcessTimes(GetCurrentProcess(), &mut created, &mut exit, &mut kernel, &mut user).is_ok() {
+            // FILETIME counts 100 ns intervals.
+            return ticks(GetSystemTimePreciseAsFileTime()).saturating_sub(ticks(created)) as f64 / 10_000.0;
+        }
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1e3
+}
+
+/// A startup milestone: time since launch.
+pub fn startup(milestone: &str) {
+    let ms = since_launch_ms();
+    record(|| format!("Startup  {ms:>8.1} ms  {milestone}"));
+}
+
 /// Append a line (built lazily, only when it can be used).
 pub fn record(line: impl FnOnce() -> String) {
     if ENABLED.load(Ordering::Relaxed) {

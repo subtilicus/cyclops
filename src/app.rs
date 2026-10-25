@@ -20,6 +20,8 @@ use crate::video::{self, VideoPlayer};
 const THUMB_DECODE_SIDE: u32 = 320;
 const MAX_LIVE_THUMBS: usize = 3000;
 const FULL_CACHE: usize = 8;
+/// GPU memory the cached full-size images may use (textures up to 16384 px are ~1 GB each).
+const FULL_CACHE_BYTES: usize = 3 << 30;
 const PREFETCH: usize = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -457,6 +459,9 @@ pub struct CyclopsApp {
 
     thumb_size: f32,
     thumbs: HashMap<PathBuf, Thumb>,
+    /// Frames drawn so far (startup milestones, and opening the GPU JPEG decoder after the first).
+    frames_drawn: u32,
+    startup_marks_done: bool,
     grid_cols: usize,
     grid_viewport: Rect,
     scroll_to_selected: bool,
@@ -501,6 +506,7 @@ pub struct CyclopsApp {
 
 impl CyclopsApp {
     pub fn new(cc: &eframe::CreationContext<'_>, start: Option<PathBuf>) -> Self {
+        crate::perflog::startup("window and GPU ready");
         let stored = |key: &str| cc.storage.and_then(|s| s.get_string(key));
         let flag = |key: &str, default: bool| stored(key).map_or(default, |s| s == "true");
         let settings = Settings {
@@ -522,13 +528,18 @@ impl CyclopsApp {
             preview_width: stored("preview_width").and_then(|s| s.parse().ok()).unwrap_or(460.0),
         };
         theme::install(&cc.egui_ctx);
-        // Open the GPU JPEG decoder now, so it is ready by the time thumbnails are requested.
-        crate::hwjpeg::set_enabled(settings.hw_jpeg);
+        // The HDR and About shaders are compiled when first needed (`hdr_gpu::upload`,
+        // `about_fx::ensure`), not here on the way to the first frame.
         if let Some(rs) = &cc.wgpu_render_state {
-            crate::hdr_gpu::init(rs);
-            crate::about_fx::init(rs);
             let info = rs.adapter.get_info();
-            log::info!("adapter: {} ({:?}, {:?}), target format {:?}", info.name, info.backend, info.device_type, rs.target_format);
+            log::info!(
+                "adapter: {} ({:?}, {:?}), target format {:?}, max texture {} px",
+                info.name,
+                info.backend,
+                info.device_type,
+                rs.target_format,
+                rs.device.limits().max_texture_dimension_2d
+            );
         }
         cc.egui_ctx.set_theme(settings.skin.preference());
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
@@ -597,6 +608,8 @@ impl CyclopsApp {
             sort_desc,
             thumb_size,
             thumbs: HashMap::new(),
+            frames_drawn: 0,
+            startup_marks_done: false,
             grid_cols: 1,
             grid_viewport: Rect::NOTHING,
             scroll_to_selected: false,
@@ -644,7 +657,27 @@ impl CyclopsApp {
                 }
             }
         }
+        crate::perflog::startup(&format!("app ready, folder listed ({} entries)", app.entries.len()));
         app
+    }
+
+    /// Developer-log milestones for the first frames.
+    fn startup_marks(&mut self) {
+        self.frames_drawn = self.frames_drawn.saturating_add(1);
+        if self.startup_marks_done {
+            return;
+        }
+        match self.frames_drawn {
+            1 => crate::perflog::startup("first frame"),
+            // eframe presents a frame before starting the next one.
+            2 => crate::perflog::startup("first frame on screen"),
+            _ => {}
+        }
+        let thumbs_done = !self.thumbs.is_empty() && !self.thumbs.values().any(|t| matches!(t, Thumb::Pending));
+        if thumbs_done || (self.frames_drawn > 2 && self.entries.is_empty()) {
+            crate::perflog::startup(&format!("visible thumbnails ready ({})", self.thumbs.len()));
+            self.startup_marks_done = true;
+        }
     }
 
     // ------------------------------------------------------------------ navigation
@@ -1001,10 +1034,13 @@ impl CyclopsApp {
         self.request_full(index);
 
         let keep: HashSet<PathBuf> = wanted.iter().map(|&i| self.entries[i].path.clone()).collect();
-        while self.full_lru.len() > FULL_CACHE {
+        let mut bytes: usize = self.full.values().map(full_bytes).sum();
+        while self.full_lru.len() > FULL_CACHE || bytes > FULL_CACHE_BYTES {
             let Some(pos) = self.full_lru.iter().position(|p| !keep.contains(p)) else { break };
             if let Some(p) = self.full_lru.remove(pos) {
-                self.full.remove(&p);
+                if let Some(old) = self.full.remove(&p) {
+                    bytes = bytes.saturating_sub(full_bytes(&old));
+                }
             }
         }
     }
@@ -1334,6 +1370,7 @@ impl CyclopsApp {
         let ring = pos2(banner.center().x, banner.min.y + 78.0);
         if self.render_state.is_some() {
             let time = ui.input(|i| i.time) as f32;
+            crate::about_fx::ensure(self.render_state.as_ref().expect("checked above"));
             painter.add(crate::about_fx::paint(banner, ring, 170.0, 12.0, time, ui.ctx().pixels_per_point()));
             ui.ctx().request_repaint();
         }
@@ -2533,6 +2570,20 @@ fn video_badge(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
     icons::paint(painter, Rect::from_center_size(center, Vec2::splat(radius * 1.1)), Icon::Play, Color32::WHITE);
 }
 
+/// Approximate GPU memory held by a cached full-size image.
+fn full_bytes(full: &Full) -> usize {
+    let Full::Ready(img) = full else { return 0 };
+    let tex = |t: &TextureHandle| t.size()[0] * t.size()[1] * 4;
+    let mut bytes = tex(&img.main) + img.screen.as_ref().map_or(0, tex);
+    bytes += img.frames.iter().map(|(t, _)| tex(t)).sum::<usize>();
+    bytes += img.subs.iter().map(|s| tex(&s.main)).sum::<usize>();
+    // HDR data: half-float RGBA with mips (~8 bytes per pixel, plus a third).
+    if img.hdr.is_some() {
+        bytes += tex(&img.main) * 2 * 4 / 3;
+    }
+    bytes
+}
+
 /// A settings row: title and optional description on the left, the control on the right.
 fn setting_row(ui: &mut egui::Ui, title: &str, description: &str, control: impl FnOnce(&mut egui::Ui)) {
     let p = theme::p();
@@ -3146,6 +3197,7 @@ fn under_root(folder: &Path, root: &Path) -> bool {
 
 impl eframe::App for CyclopsApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.startup_marks();
         let ctx = ui.ctx().clone();
         theme::sync(&ctx);
         self.backdrop = None;
@@ -3159,7 +3211,9 @@ impl eframe::App for CyclopsApp {
             self.chrome_state = Some((dark, material));
         }
         crate::perflog::set_enabled(self.settings.perf_log);
-        crate::hwjpeg::set_enabled(self.settings.hw_jpeg);
+        // The GPU JPEG decoder opens once the first frame is on screen: opening it earlier competes
+        // with the window's own GPU setup, and the CPU decodes anything needed before it is ready.
+        crate::hwjpeg::set_enabled(self.settings.hw_jpeg && self.frames_drawn >= 2);
         // Coming back to the window (e.g. from the photo editor): pick up changed files.
         let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         if focused && !self.was_focused {

@@ -75,8 +75,11 @@ struct Resources {
     linear_out: bool,
 }
 
-/// Create the pipeline. Call once with eframe's wgpu render state.
-pub fn init(render_state: &egui_wgpu::RenderState) {
+/// Create the pipeline the first time it is needed.
+pub fn ensure(render_state: &egui_wgpu::RenderState) {
+    if render_state.renderer.read().callback_resources.get::<Resources>().is_some() {
+        return;
+    }
     let device = &render_state.device;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("cyclops-about"),

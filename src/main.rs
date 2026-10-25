@@ -23,7 +23,26 @@ mod wic;
 
 use std::path::PathBuf;
 
+/// eframe's defaults, but with the largest textures the GPU supports (egui-wgpu asks for 8192,
+/// which would show large scans and panoramas downscaled even at 100%).
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, wgpu};
+    let mut options = WgpuConfiguration::default();
+    if let WgpuSetup::CreateNew(create) = &mut options.wgpu_setup {
+        create.device_descriptor = std::sync::Arc::new(|adapter| wgpu::DeviceDescriptor {
+            label: Some("cyclops"),
+            required_limits: wgpu::Limits {
+                max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d.max(8192),
+                ..wgpu::Limits::default()
+            },
+            ..Default::default()
+        });
+    }
+    options
+}
+
 fn main() -> eframe::Result {
+    perflog::startup("main");
     diag::init();
     let start = std::env::args_os().nth(1).map(PathBuf::from);
     // Windows: render with DirectX 12 and present through DirectComposition, the only
@@ -37,9 +56,6 @@ fn main() -> eframe::Result {
             unsafe { std::env::set_var(key, value) };
         }
     }
-    // Open the GPU JPEG decoder while the window is being created (it takes ~100 ms); the
-    // Settings switch decides whether it is used.
-    hwjpeg::warm_up();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Cyclops Image Browser")
@@ -48,6 +64,7 @@ fn main() -> eframe::Result {
             .with_min_inner_size([640.0, 400.0])
             .with_transparent(true),
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
     // Windows takes the icon from the exe's resources (see `chrome::style`). An empty icon keeps
@@ -61,6 +78,7 @@ fn main() -> eframe::Result {
         )),
         ..options
     };
+    perflog::startup("creating window");
     eframe::run_native(
         "Cyclops",
         options,

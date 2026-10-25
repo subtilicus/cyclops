@@ -176,8 +176,11 @@ struct Resources {
     encode_srgb: bool,
 }
 
-/// Create the pipeline. Call once with eframe's wgpu render state.
-pub fn init(render_state: &egui_wgpu::RenderState) {
+/// Create the pipeline the first time it is needed.
+fn ensure(render_state: &egui_wgpu::RenderState) {
+    if render_state.renderer.read().callback_resources.get::<Resources>().is_some() {
+        return;
+    }
     let device = &render_state.device;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("cyclops-hdr"),
@@ -297,6 +300,7 @@ impl Drop for HdrTexture {
 /// Upload the mip chain (level 0 first, RGBA f16 texels).
 pub fn upload(render_state: &egui_wgpu::RenderState, levels: &[HdrLevel]) -> Option<HdrTexture> {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    ensure(render_state);
     let base = levels.first()?;
     let device = &render_state.device;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
