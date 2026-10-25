@@ -66,8 +66,15 @@ Network node, or type `\\server` or `\\server\share` in the path bar; visited se
 **Images:** JPEG, PNG/APNG, GIF, WebP, BMP, TIFF, ICO, TGA, DDS, HDR, EXR, QOI, PNM, SVG and PSD (composite)
 are decoded in-process, as are GPU textures (DDS, KTX, KTX2: BC1–7, ETC1/2, EAC, ASTC, uncompressed
 and half/float, Zstandard-supercompressed KTX2, Basis Universal ETC1S/UASTC/UASTC HDR via the vendored open-source transcoder;
-step through mips, array layers and cube faces with Ctrl+arrows); HEIC/HEIF, AVIF, JPEG XL, JPEG XR and camera RAW (DNG, CR2/CR3, NEF, ARW, RAF,
-ORF, RW2, …) go through the Windows Imaging Component, using the OS's (free) codec extensions.
+step through mips, array layers and cube faces with Ctrl+arrows); HEIC/HEIF, AVIF, JPEG XL and JPEG XR go
+through the Windows Imaging Component, using the OS's (free) codec extensions.
+
+**Camera RAW** (DNG, CR2/CR3/CRW, NEF/NRW, ARW/SR2/SRF, RAF, ORF, RW2/RWL, PEF, SRW, 3FR/FFF, IIQ, MEF,
+MOS, ERF, KDC/DCR, MRW, X3F, …) is developed by the vendored LibRaw at the sensor's full bit depth into
+linear light: the exposure slider pulls highlights back up to the sensor's clipping point. The viewer
+shows the camera's embedded preview instantly and swaps in the develop (~1 s for 24 MP, multi-threaded);
+thumbnails use the embedded preview. Anything LibRaw can't read falls back to Windows' Raw Image
+Extension. On a one-per-maker sample of raw.pixls.us (70 files), 61 open.
 Animated GIF, WebP and APNG play in the viewer and preview. HDR/EXR are tone-mapped (auto exposure +
 ACES) with a live exposure slider, and can be viewed as a mirror sphere or a 360° panorama.
 

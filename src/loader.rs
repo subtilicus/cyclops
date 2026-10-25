@@ -33,6 +33,8 @@ pub struct Loaded {
     pub path: PathBuf,
     pub kind: Kind,
     pub result: Result<Images, String>,
+    /// A stand-in shown until the real result follows (a RAW's embedded preview).
+    pub provisional: bool,
 }
 
 pub struct Images {
@@ -154,7 +156,7 @@ fn worker(
                     decode_ms: start.elapsed().as_secs_f32() * 1000.0,
                 })
                 .ok_or_else(|| "no thumbnail".to_owned());
-            if done_tx.send(Loaded { path: job.path, kind: job.kind, result }).is_err() {
+            if done_tx.send(Loaded { path: job.path, kind: job.kind, result, provisional: false }).is_err() {
                 return;
             }
             ctx.request_repaint();
@@ -164,7 +166,7 @@ fn worker(
         if job.kind == Kind::Thumb && decode::prefers_shell_thumbnail(&job.path) {
             if let Some(main) = crate::shell::thumbnail_only(&job.path, job.max_side) {
                 let images = Images { source_size: main.size, main, screen: None, frames: Vec::new(), hdr: None, blur: None, bit_depth: None, format: None, sub_layout: None, subimages: Vec::new(), decode_ms: 0.0 };
-                if done_tx.send(Loaded { path: job.path, kind: job.kind, result: Ok(images) }).is_err() {
+                if done_tx.send(Loaded { path: job.path, kind: job.kind, result: Ok(images), provisional: false }).is_err() {
                     return;
                 }
                 ctx.request_repaint();
@@ -172,42 +174,22 @@ fn worker(
             }
         }
         let full = job.kind == Kind::Full;
+        // Camera RAW: show the embedded preview straight away; developing takes a second or so.
+        if full && crate::wic::is_camera_raw(&job.path) {
+            if let Some(d) = decode::raw_preview_file(&job.path, job.screen_side.max(1024)) {
+                let images = images_from(d, &job, start);
+                crate::perflog::record(|| format!("Preview  {:>6.1} ms  {}", images.decode_ms, job.path.display()));
+                if done_tx.send(Loaded { path: job.path.clone(), kind: job.kind, result: Ok(images), provisional: true }).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+        }
         let vector_side = if full { job.screen_side.max(1024) } else { job.max_side };
         let mut decode_ms = 0.0;
         let result = decode::decode(&job.path, job.max_side, vector_side, full).map(|d| {
             decode_ms = start.elapsed().as_secs_f32() * 1000.0;
-            let source_size = [d.source_size[0] as usize, d.source_size[1] as usize];
-            let frames: Vec<(ColorImage, f32)> = d
-                .frames
-                .into_iter()
-                .map(|(img, secs)| (to_color_image(decode::fit_within(img, job.max_side), false), secs))
-                .collect();
-            let main_img = decode::fit_within(d.image, job.max_side);
-            let screen = (job.kind == Kind::Full && frames.is_empty())
-                .then(|| {
-                    let longest = main_img.width().max(main_img.height());
-                    // Only worth it when the image is substantially larger than the screen.
-                    (longest as f32 > job.screen_side as f32 * 1.5)
-                        .then(|| to_color_image(decode::downscaled(&main_img, job.screen_side), d.opaque))
-                })
-                .flatten();
-            let main = to_color_image(main_img, d.opaque);
-            let blur = full.then(|| crate::glass::blurred(&main.pixels, main.size));
-            let hdr = if full { d.hdr } else { None };
-            let bit_depth = d.bit_depth;
-            let format = d.format;
-            let sub_layout = d.sub_layout;
-            let subimages = d
-                .subimages
-                .into_iter()
-                .map(|(coords, sub)| SubImage {
-                    coords,
-                    size: [sub.image.width() as usize, sub.image.height() as usize],
-                    main: to_color_image(decode::fit_within(sub.image, job.max_side), sub.opaque),
-                    hdr: sub.hdr,
-                })
-                .collect();
-            Images { main, screen, source_size, frames, hdr, blur, bit_depth, format, sub_layout, subimages, decode_ms: start.elapsed().as_secs_f32() * 1000.0 }
+            images_from(d, &job, start)
         });
         crate::perflog::record(|| match &result {
             Ok(img) => format!(
@@ -216,10 +198,57 @@ fn worker(
             ),
             Err(e) => format!("{:?}  failed: {e}  {}", job.kind, job.path.display()),
         });
-        if done_tx.send(Loaded { path: job.path, kind: job.kind, result }).is_err() {
+        if done_tx.send(Loaded { path: job.path, kind: job.kind, result, provisional: false }).is_err() {
             return;
         }
         ctx.request_repaint();
+    }
+}
+
+/// What the UI uploads for a decoded image: fitted to the texture limit, plus the screen-size
+/// copy and blurred backdrop for full-size requests.
+fn images_from(d: decode::Decoded, job: &Job, start: Instant) -> Images {
+    let full = job.kind == Kind::Full;
+    let source_size = [d.source_size[0] as usize, d.source_size[1] as usize];
+    let frames: Vec<(ColorImage, f32)> = d
+        .frames
+        .into_iter()
+        .map(|(img, secs)| (to_color_image(decode::fit_within(img, job.max_side), false), secs))
+        .collect();
+    let main_img = decode::fit_within(d.image, job.max_side);
+    let screen = (full && frames.is_empty())
+        .then(|| {
+            let longest = main_img.width().max(main_img.height());
+            // Only worth it when the image is substantially larger than the screen.
+            (longest as f32 > job.screen_side as f32 * 1.5)
+                .then(|| to_color_image(decode::downscaled(&main_img, job.screen_side), d.opaque))
+        })
+        .flatten();
+    let main = to_color_image(main_img, d.opaque);
+    let blur = full.then(|| crate::glass::blurred(&main.pixels, main.size));
+    let hdr = if full { d.hdr } else { None };
+    let subimages = d
+        .subimages
+        .into_iter()
+        .map(|(coords, sub)| SubImage {
+            coords,
+            size: [sub.image.width() as usize, sub.image.height() as usize],
+            main: to_color_image(decode::fit_within(sub.image, job.max_side), sub.opaque),
+            hdr: sub.hdr,
+        })
+        .collect();
+    Images {
+        main,
+        screen,
+        source_size,
+        frames,
+        hdr,
+        blur,
+        bit_depth: d.bit_depth,
+        format: d.format,
+        sub_layout: d.sub_layout,
+        subimages,
+        decode_ms: start.elapsed().as_secs_f32() * 1000.0,
     }
 }
 

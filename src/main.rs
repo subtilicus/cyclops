@@ -13,6 +13,7 @@ mod glass;
 mod hdr_gpu;
 mod hwjpeg;
 mod icons;
+mod libraw;
 mod loader;
 mod ops;
 mod perflog;

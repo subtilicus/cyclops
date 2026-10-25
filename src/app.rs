@@ -933,6 +933,10 @@ impl CyclopsApp {
                 }
                 Kind::Full => {
                     if let Some(slot) = self.full.get_mut(&loaded.path) {
+                        // A stand-in (RAW preview) only fills an empty slot, and only if it worked.
+                        if loaded.provisional && (!matches!(slot, Full::Pending) || loaded.result.is_err()) {
+                            continue;
+                        }
                         *slot = match loaded.result {
                             Ok(images) => Full::Ready({
                                 let main_tex = ctx.load_texture(name.clone(), images.main, TextureOptions::LINEAR);
@@ -1439,7 +1443,8 @@ impl CyclopsApp {
         ui.label(
             egui::RichText::new(
                 "egui and eframe, wgpu, image, zune-jpeg, resvg, psd, texture2ddecoder, bcdec_rs, ddsfile, ktx2, ruzstd, \
-                 Basis Universal (Apache-2.0, Binomial), Zstandard (BSD, Meta) and windows-rs.",
+                 LibRaw (CDDL-1.0, LibRaw LLC, libraw.org), Basis Universal (Apache-2.0, Binomial), \
+                 Zstandard (BSD, Meta), zlib and windows-rs.",
             )
             .size(12.0)
             .color(p.text_dim),

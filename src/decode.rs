@@ -122,6 +122,11 @@ impl Decoded {
 /// GIF/WebP/APNG return all frames.
 pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Result<Decoded, String> {
     let ext = extension(path);
+    if crate::wic::is_camera_raw(path) {
+        // LibRaw first (full sensor bit depth); Windows' Raw Image Decoder for what it can't read.
+        let raw = std::fs::read(path).map_err(|e| e.to_string()).and_then(|bytes| decode_raw(&bytes, max_side, animate));
+        return raw.or_else(|e| from_wic(path, max_side, animate).map_err(|_| codec_hint(&ext, e)));
+    }
     if crate::wic::handles(path) {
         return from_wic(path, max_side, animate).map_err(|e| codec_hint(&ext, e));
     }
@@ -175,6 +180,9 @@ enum Light {
     DisplayLinear,
     /// Display-referred, sRGB-encoded (16-bit PNG/TIFF): linearised, shown as-is at 0 EV.
     DisplaySrgb,
+    /// Developed camera RAW: linear, 1.0 = sensor saturation. Shown clipped like a photo at
+    /// `exposure`, so lowering exposure recovers highlights up to the sensor's own limit.
+    Raw { exposure: f32 },
 }
 
 /// Build GPU exposure data from high-precision pixels (scaled to at most `max_side`).
@@ -198,6 +206,7 @@ fn high_precision(mut img: image::Rgba32FImage, max_side: u32, light: Light) -> 
     }
     let (auto_exposure, tonemap) = match light {
         Light::Scene => (auto_exposure(&pixels), true),
+        Light::Raw { exposure } => (exposure, false),
         _ => (1.0, false),
     };
     Hdr { levels: hdr_mips(pixels, size), auto_exposure, tonemap }
@@ -467,6 +476,105 @@ fn decode_psd(bytes: &[u8]) -> Result<Decoded, String> {
     Ok(Decoded { bit_depth: Some(BitDepth { bits, float: bits == 32 }), ..Decoded::still(image, opaque) })
 }
 
+/// Camera RAW through LibRaw. Viewer images are developed from the sensor data to linear 16-bit;
+/// thumbnails use the camera's embedded preview when it is big enough, else a fast half-size
+/// develop.
+fn decode_raw(bytes: &[u8], max_side: u32, full: bool) -> Result<Decoded, String> {
+    use rayon::prelude::*;
+    let raw = crate::libraw::Raw::open(bytes)?;
+    let meta = raw.metadata();
+    let bit_depth = Some(BitDepth { bits: meta.bits, float: false });
+    let format = Some(meta.camera.clone()).filter(|c| !c.is_empty());
+    if !full {
+        if let Some(image) = raw_preview(&raw, &meta, max_side) {
+            return Ok(Decoded { source_size: meta.size, bit_depth, format, ..Decoded::still(fit_within(image, max_side), true) });
+        }
+    }
+    let half = !full && meta.size[0].max(meta.size[1]) / 2 >= max_side;
+    raw.develop(half, |w, h, rgb| {
+        let exposure = raw_exposure(rgb);
+        // 8-bit sRGB copy for thumbnails, the blurred backdrop and the screen-size copy.
+        let lut: Vec<u8> = (0..=u16::MAX as u32)
+            .map(|v| {
+                let c = (v as f32 / 65535.0 * exposure).min(1.0);
+                let s = if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+                (s * 255.0 + 0.5) as u8
+            })
+            .collect();
+        let mut srgb = vec![255u8; w as usize * h as usize * 4];
+        srgb.par_chunks_mut(4).zip(rgb.par_chunks(3)).for_each(|(o, i)| {
+            o[0] = lut[i[0] as usize];
+            o[1] = lut[i[1] as usize];
+            o[2] = lut[i[2] as usize];
+        });
+        let image = RgbaImage::from_raw(w, h, srgb).expect("buffer size");
+        let hdr = full.then(|| {
+            let mut linear = vec![1.0f32; w as usize * h as usize * 4];
+            linear.par_chunks_mut(4).zip(rgb.par_chunks(3)).for_each(|(o, i)| {
+                for c in 0..3 {
+                    o[c] = i[c] as f32 / 65535.0;
+                }
+            });
+            let linear = image::Rgba32FImage::from_raw(w, h, linear).expect("buffer size");
+            high_precision(linear, max_side, Light::Raw { exposure })
+        });
+        let source_size = if half { meta.size } else { [w, h] };
+        Decoded { source_size, hdr, bit_depth, format, ..Decoded::still(fit_within(image, max_side), true) }
+    })
+}
+
+/// A camera RAW's embedded preview at up to `max_side`, with the RAW's real size and metadata:
+/// shown in the viewer while the full develop runs. `None` if there is no usable preview.
+pub fn raw_preview_file(path: &Path, max_side: u32) -> Option<Decoded> {
+    let bytes = std::fs::read(path).ok()?;
+    let raw = crate::libraw::Raw::open(&bytes).ok()?;
+    let meta = raw.metadata();
+    let image = raw_preview(&raw, &meta, max_side)?;
+    Some(Decoded {
+        source_size: meta.size,
+        bit_depth: Some(BitDepth { bits: meta.bits, float: false }),
+        format: Some(meta.camera.clone()).filter(|c| !c.is_empty()),
+        ..Decoded::still(fit_within(image, max_side), true)
+    })
+}
+
+/// Exposure that puts the brightest 1% of pixels at white, like LibRaw's (and dcraw's) automatic
+/// brightness, within sensible limits.
+fn raw_exposure(rgb: &[u16]) -> f32 {
+    let mut histogram = vec![0u32; 1 << 12];
+    let mut count = 0u32;
+    for p in rgb.chunks_exact(3).step_by(5) {
+        histogram[(p[0].max(p[1]).max(p[2]) >> 4) as usize] += 1;
+        count += 1;
+    }
+    let mut above = 0;
+    let mut white = histogram.len();
+    while white > 1 && above < count / 100 {
+        white -= 1;
+        above += histogram[white];
+    }
+    (histogram.len() as f32 / white.max(1) as f32).clamp(0.25, 64.0)
+}
+
+/// The camera's embedded preview, oriented, if it is large enough for a thumbnail (old cameras
+/// often keep only a 160 px one).
+fn raw_preview(raw: &crate::libraw::Raw, meta: &crate::libraw::Metadata, max_side: u32) -> Option<RgbaImage> {
+    let image = match raw.preview().ok()? {
+        crate::libraw::Preview::Jpeg(bytes) => {
+            let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA).set_strict_mode(false);
+            let mut decoder = JpegDecoder::new_with_options(ZCursor::new(&bytes[..]), options);
+            let pixels = decoder.decode().ok()?;
+            let info = decoder.info()?;
+            RgbaImage::from_raw(info.width as u32, info.height as u32, pixels)?
+        }
+        crate::libraw::Preview::Rgb { width, height, pixels } => {
+            let rgba = pixels.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+            RgbaImage::from_raw(width, height, rgba)?
+        }
+    };
+    (image.width().max(image.height()) >= max_side.min(400)).then(|| apply_orientation(image, meta.orientation))
+}
+
 /// `full`: a viewer image, which may use the GPU's JPEG decoder (see `hwjpeg`).
 fn decode_jpeg(bytes: &[u8], full: bool) -> Result<Decoded, String> {
     // Large baseline 4:2:0 photos go to the GPU's JPEG decoder when one is free.
@@ -673,6 +781,50 @@ mod raw_survey {
         files.sort();
         let (mut ok, mut failed) = (0, 0);
         for f in &files {
+            if let Some(out) = std::env::var_os("CYCLOPS_RAW_COMPARE") {
+                // Developed image and embedded preview side by side, for checking colour/orientation.
+                let bytes = std::fs::read(f).unwrap();
+                let (Ok(dev), Ok(pre)) = (super::decode_raw(&bytes, 16384, true), super::decode_raw(&bytes, 640, false)) else { continue };
+                let dev = super::fit_within(dev.image, 640);
+                let pre = super::fit_within(pre.image, 640);
+                let mut sheet = image::RgbaImage::from_pixel(1290, 650, image::Rgba([40, 40, 40, 255]));
+                image::imageops::overlay(&mut sheet, &dev, 0, 0);
+                image::imageops::overlay(&mut sheet, &pre, 650, 0);
+                let name = f.file_stem().unwrap().to_string_lossy().replace(' ', "_");
+                sheet.save(std::path::Path::new(&out).join(format!("{name}.png"))).unwrap();
+                ok += 1;
+                continue;
+            }
+            if std::env::var_os("CYCLOPS_RAW_LIBRAW").is_some() {
+                let bytes = std::fs::read(f).unwrap();
+                let t = Instant::now();
+                let thumb = super::decode_raw(&bytes, 512, false);
+                let thumb_ms = t.elapsed().as_secs_f64() * 1e3;
+                let t = Instant::now();
+                match super::decode_raw(&bytes, 16384, true) {
+                    Ok(d) => {
+                        ok += 1;
+                        let ev = d.hdr.as_ref().map_or(0.0, |h| h.auto_exposure.log2());
+                        println!(
+                            "OK   full {:>6.0} ms  thumb {:>5.0} ms {:<9} {:>5}x{:<5} {:>2}-bit  {:+.1} EV  {}  [{}]",
+                            t.elapsed().as_secs_f64() * 1e3,
+                            thumb_ms,
+                            match &thumb { Ok(t) if t.hdr.is_none() && t.image.width() >= 400 => "(preview)", Ok(_) => "(develop)", Err(_) => "(failed)" },
+                            d.source_size[0],
+                            d.source_size[1],
+                            d.bit_depth.map_or(0, |b| b.bits),
+                            ev,
+                            f.file_name().unwrap().to_string_lossy(),
+                            d.format.unwrap_or_default()
+                        );
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        println!("FAIL {e}  {}", f.file_name().unwrap().to_string_lossy());
+                    }
+                }
+                continue;
+            }
             if std::env::var_os("CYCLOPS_RAW_DESCRIBE").is_some() {
                 println!("{}  {}", crate::wic::describe(f), f.file_name().unwrap().to_string_lossy());
                 continue;

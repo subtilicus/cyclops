@@ -26,7 +26,49 @@ fn main() {
         .warnings(false)
         .compile("cyclops_zstddec");
 
+    libraw(tp);
     windows_resources();
+}
+
+/// LibRaw (CDDL-1.0 / LGPL-2.1, used under the CDDL, unmodified) for camera RAW, with zlib for
+/// deflate-compressed and floating-point DNGs.
+fn libraw(tp: &str) {
+    let root = format!("{tp}/libraw");
+    println!("cargo:rerun-if-changed={root}");
+    println!("cargo:rerun-if-changed={tp}/libraw_shim.cpp");
+    let mut sources = vec![std::path::PathBuf::from(format!("{tp}/libraw_shim.cpp"))];
+    let mut dirs = vec![std::path::PathBuf::from(format!("{root}/src"))];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("libraw sources").flatten() {
+            let path = entry.path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if name.ends_with(".cpp") && !name.ends_with("_ph.cpp") {
+                // *_ph.cpp are placeholders the upstream build doesn't compile either.
+                sources.push(path);
+            }
+        }
+    }
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .include(&root)
+        .files(&sources)
+        .define("LIBRAW_NODLL", None)
+        .define("LIBRAW_BUILDLIB", None)
+        .define("USE_ZLIB", None)
+        .warnings(false);
+    if let Some(zlib) = std::env::var_os("DEP_Z_INCLUDE") {
+        build.include(zlib);
+    }
+    if build.get_compiler().is_like_msvc() {
+        build.flag("/EHsc").flag("/utf-8").define("WIN32", None).define("_CRT_SECURE_NO_WARNINGS", None);
+        // Multi-threaded demosaicing and decoding: 2-4x faster develops (needs vcomp140.dll, part
+        // of the Visual C++ runtime the exe already uses).
+        build.flag("/openmp");
+    }
+    build.compile("cyclops_libraw");
 }
 
 /// The exe's icon (Explorer, Start, Alt+Tab) and version information (file properties, Task
