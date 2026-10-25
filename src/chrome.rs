@@ -34,6 +34,14 @@ impl Material {
     }
 }
 
+/// Where Windows' caption buttons run into our content: a maximized window loses its top frame
+/// off-screen and its title bar shrinks by that much, but the buttons (and the red close hover)
+/// keep their height. Returns the overlap's height and the buttons' left edge, in physical
+/// pixels from the client area's top-left; `None` when nothing overlaps.
+pub fn caption_overlap(frame: &eframe::Frame) -> Option<(f32, f32)> {
+    imp::caption_overlap(frame)
+}
+
 /// Style the OS window frame. Windows 11 honours all of it; Windows 10 applies dark mode only.
 pub fn style(frame: &eframe::Frame, dark: bool, material: Material, caption: Color32, text: Color32, border: Color32) {
     imp::style(frame, dark, material, caption, text, border);
@@ -54,10 +62,44 @@ mod imp {
         COLORREF(c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16)
     }
 
+    fn hwnd(frame: &eframe::Frame) -> Option<HWND> {
+        let handle = frame.window_handle().ok()?;
+        let RawWindowHandle::Win32(win) = handle.as_raw() else { return None };
+        Some(HWND(win.hwnd.get() as *mut _))
+    }
+
+    pub fn caption_overlap(frame: &eframe::Frame) -> Option<(f32, f32)> {
+        use windows::Win32::Foundation::{POINT, RECT};
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let hwnd = hwnd(frame)?;
+        unsafe {
+            let captioned = (GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CAPTION.0) == WS_CAPTION.0;
+            if !captioned || !IsZoomed(hwnd).as_bool() {
+                return None;
+            }
+            let mut window = RECT::default();
+            GetWindowRect(hwnd, &mut window).ok()?;
+            let mut origin = POINT::default();
+            ClientToScreen(hwnd, &mut origin).ok().ok()?;
+            let mut buttons = RECT::default();
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_BUTTON_BOUNDS,
+                &mut buttons as *mut RECT as *mut _,
+                size_of::<RECT>() as u32,
+            )
+            .ok()?;
+            // The buttons keep roughly the height of the frame that went off-screen.
+            let dpi = GetDpiForWindow(hwnd).max(96);
+            let hidden = GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+            Some((hidden as f32, (window.left + buttons.left - origin.x) as f32))
+        }
+    }
+
     pub fn style(frame: &eframe::Frame, dark: bool, material: Material, caption: Color32, text: Color32, border: Color32) {
-        let Ok(handle) = frame.window_handle() else { return };
-        let RawWindowHandle::Win32(win) = handle.as_raw() else { return };
-        let hwnd = HWND(win.hwnd.get() as *mut _);
+        let Some(hwnd) = hwnd(frame) else { return };
         unsafe fn set<T>(hwnd: HWND, attribute: DWMWINDOWATTRIBUTE, value: &T) {
             // Older Windows versions reject unknown attributes; that's fine.
             let _ = unsafe { DwmSetWindowAttribute(hwnd, attribute, value as *const T as *const _, size_of::<T>() as u32) };
@@ -131,4 +173,8 @@ mod imp {
     use super::Material;
 
     pub fn style(_frame: &eframe::Frame, _dark: bool, _material: Material, _caption: Color32, _text: Color32, _border: Color32) {}
+
+    pub fn caption_overlap(_frame: &eframe::Frame) -> Option<(f32, f32)> {
+        None
+    }
 }

@@ -1176,7 +1176,7 @@ impl CyclopsApp {
                             ui.spacing_mut().item_spacing.y = 4.0;
                             ui.label(egui::RichText::new("Settings").size(18.0).color(p.text_strong));
                             ui.add_space(14.0);
-                            for candidate in SettingsPage::ALL {
+                            for candidate in SettingsPage::ALL.into_iter().filter(|&p| p != SettingsPage::Developer || developer_mode()) {
                                 let selected = page == candidate;
                                 let text = egui::RichText::new(candidate.label())
                                     .size(14.0)
@@ -2570,6 +2570,13 @@ fn video_badge(painter: &egui::Painter, center: egui::Pos2, radius: f32) {
     icons::paint(painter, Rect::from_center_size(center, Vec2::splat(radius * 1.1)), Icon::Play, Color32::WHITE);
 }
 
+/// Developer tools (the Developer settings page and its log) exist in debug builds, or in any
+/// build started with `CYCLOPS_DEV=1`.
+fn developer_mode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(debug_assertions) || std::env::var("CYCLOPS_DEV").is_ok_and(|v| v == "1"))
+}
+
 /// Approximate GPU memory held by a cached full-size image.
 fn full_bytes(full: &Full) -> usize {
     let Full::Ready(img) = full else { return 0 };
@@ -3210,7 +3217,7 @@ impl eframe::App for CyclopsApp {
             crate::chrome::style(frame, dark, material, p.panel, p.text, p.border);
             self.chrome_state = Some((dark, material));
         }
-        crate::perflog::set_enabled(self.settings.perf_log);
+        crate::perflog::set_enabled(self.settings.perf_log && developer_mode());
         // The GPU JPEG decoder opens once the first frame is on screen: opening it earlier competes
         // with the window's own GPU setup, and the CPU decodes anything needed before it is ready.
         crate::hwjpeg::set_enabled(self.settings.hw_jpeg && self.frames_drawn >= 2);
@@ -3255,6 +3262,17 @@ impl eframe::App for CyclopsApp {
             self.video = None;
         }
 
+        // Maximized: a strip in the title bar's own (opaque) colour under the part of the caption
+        // buttons that reaches into the window, left clear under the buttons themselves so the red
+        // close hover isn't darkened by our translucent toolbar.
+        if let Some((height, buttons_left)) = crate::chrome::caption_overlap(frame) {
+            let ppp = ctx.pixels_per_point();
+            egui::Panel::top("caption-overlap").exact_size(height / ppp).frame(egui::Frame::NONE).show(ui, |ui| {
+                let rect = ui.max_rect();
+                let left = Rect::from_min_max(rect.min, pos2((buttons_left / ppp).min(rect.max.x), rect.max.y));
+                ui.painter().rect_filled(left, CornerRadius::ZERO, theme::p().panel);
+            });
+        }
         if self.viewer.is_some() {
             egui::CentralPanel::no_frame()
                 .frame(egui::Frame::NONE.fill(theme::p().viewer_bg))

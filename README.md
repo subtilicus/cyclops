@@ -86,6 +86,10 @@ decode on the GPU, so Cyclops bundles no codecs and carries no codec licensing o
 cargo build --release
 ```
 
+Debug builds have a **Developer** settings page with a log (`%LOCALAPPDATA%\Cyclops\perf.log`:
+decode times, startup milestones, GPU setup, warnings). Release builds hide it; start one with
+`CYCLOPS_DEV=1` to get it back.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
