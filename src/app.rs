@@ -1361,7 +1361,6 @@ impl CyclopsApp {
 
     fn settings_about(&mut self, ui: &mut egui::Ui) {
         let p = theme::p();
-        const REPO: &str = env!("CARGO_PKG_REPOSITORY");
         // Banner: an animated ring (a shader) with the name below. It stays dark in both skins,
         // since the ring is light added onto it.
         let (banner, _) = ui.allocate_exact_size(vec2(ui.available_width(), 196.0), Sense::hover());
@@ -1411,9 +1410,6 @@ impl CyclopsApp {
                         ui.add(egui::Label::new(egui::RichText::new(value).color(p.text)).truncate());
                         ui.end_row();
                     }
-                    ui.label(egui::RichText::new("Source code").color(p.text_dim));
-                    ui.hyperlink_to(REPO.trim_start_matches("https://"), REPO);
-                    ui.end_row();
                 });
             });
         ui.add_space(12.0);
@@ -1425,9 +1421,6 @@ impl CyclopsApp {
                     .corner_radius(CornerRadius::same(8))
                     .min_size(vec2(0.0, 30.0))
             };
-            if ui.add(button("Report a problem…")).clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(format!("{REPO}/issues")));
-            }
             if ui.add(button("Copy system info")).on_hover_text("For bug reports").clicked() {
                 let info = format!(
                     "Cyclops {}\nGraphics: {}\nJPEG decoding: {jpeg}\nOS: {} {}",
