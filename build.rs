@@ -27,7 +27,74 @@ fn main() {
         .compile("cyclops_zstddec");
 
     libraw(tp);
+    gpr(tp);
     windows_resources();
+}
+
+/// The parts of GoPro's GPR SDK (Apache-2.0/MIT; bundled Adobe DNG SDK and XMP: BSD; expat: MIT)
+/// needed to convert GPR files (VC-5 compressed DNGs) to plain DNGs for LibRaw.
+fn gpr(tp: &str) {
+    let lib = format!("{tp}/gpr/source/lib");
+    println!("cargo:rerun-if-changed={tp}/gpr");
+    println!("cargo:rerun-if-changed={tp}/gpr_shim.cpp");
+    let files = |dir: &str, ext: &str| -> Vec<std::path::PathBuf> {
+        let mut out: Vec<_> = std::fs::read_dir(format!("{lib}/{dir}"))
+            .expect("gpr sources")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == ext))
+            .collect();
+        out.sort();
+        out
+    };
+    let includes = [
+        "common/public",
+        "common/private",
+        "vc5_common",
+        "vc5_decoder",
+        "dng_sdk",
+        "xmp_core/public/include",
+        "expat_lib",
+        "md5_lib",
+        "gpr_sdk/public",
+        "gpr_sdk/private",
+    ];
+    let configure = |build: &mut cc::Build| {
+        for dir in includes {
+            build.include(format!("{lib}/{dir}"));
+        }
+        build
+            .define("XML_STATIC", "1")
+            .define("GPR_READING", "1")
+            .define("GPR_WRITING", "0")
+            .define("GPR_JPEG_AVAILABLE", "0")
+            .warnings(false);
+        if build.get_compiler().is_like_msvc() {
+            // A plain absolute path: cl.exe can't open canonicalize()'s \\?\ form.
+            let compat = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join(tp).join("gpr_compat.h");
+            build.flag(format!("/FI{}", compat.display())).define("_CRT_SECURE_NO_WARNINGS", None);
+        }
+    };
+
+    let mut c = cc::Build::new();
+    configure(&mut c);
+    for dir in ["common/private", "vc5_common", "vc5_decoder", "expat_lib", "md5_lib"] {
+        c.files(files(dir, "c"));
+    }
+    c.compile("cyclops_gpr_c");
+
+    let mut cpp = cc::Build::new();
+    cpp.cpp(true);
+    configure(&mut cpp);
+    for dir in ["dng_sdk", "xmp_core", "gpr_sdk/private"] {
+        cpp.files(files(dir, "cpp"));
+    }
+    cpp.files(files("common/private", "cpp"));
+    cpp.file(format!("{tp}/gpr_shim.cpp"));
+    if cpp.get_compiler().is_like_msvc() {
+        cpp.flag("/EHsc").flag("/utf-8");
+    }
+    cpp.compile("cyclops_gpr");
 }
 
 /// LibRaw (CDDL-1.0 / LGPL-2.1, used under the CDDL, unmodified) for camera RAW, with zlib for

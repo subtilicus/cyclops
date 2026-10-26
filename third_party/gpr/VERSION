@@ -1,0 +1,1 @@
+GoPro GPR SDK (github.com/gopro/gpr) at 446c736a38fb14f51343605c0780d347dc602f89, unmodified; only the libraries needed to read GPR files (no VC-5 encoder, JPEG writer or apps).

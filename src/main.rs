@@ -10,6 +10,7 @@ mod editor;
 mod fs;
 mod gputex;
 mod glass;
+mod gpr;
 mod hdr_gpu;
 mod hwjpeg;
 mod icons;

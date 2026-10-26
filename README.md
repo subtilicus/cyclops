@@ -70,11 +70,12 @@ step through mips, array layers and cube faces with Ctrl+arrows); HEIC/HEIF, AVI
 through the Windows Imaging Component, using the OS's (free) codec extensions.
 
 **Camera RAW** (DNG, CR2/CR3/CRW, NEF/NRW, ARW/SR2/SRF, RAF, ORF, RW2/RWL, PEF, SRW, 3FR/FFF, IIQ, MEF,
-MOS, ERF, KDC/DCR, MRW, X3F, …) is developed by the vendored LibRaw at the sensor's full bit depth into
+MOS, ERF, KDC/DCR, MRW, X3F, GoPro GPR, …) is developed by the vendored LibRaw at the sensor's full bit depth into
 linear light: the exposure slider pulls highlights back up to the sensor's clipping point. The viewer
 shows the camera's embedded preview instantly and swaps in the develop (~1 s for 24 MP, multi-threaded);
 thumbnails use the embedded preview. Anything LibRaw can't read falls back to Windows' Raw Image
-Extension. On a one-per-maker sample of raw.pixls.us (70 files), 61 open.
+Extension. GoPro GPRs (VC-5 compressed DNGs) are converted to plain DNGs by the vendored GPR SDK first.
+On a one-per-maker sample of raw.pixls.us (70 files), 62 open; all 17 GoPro samples (HERO5–11, Fusion) do.
 Animated GIF, WebP and APNG play in the viewer and preview. HDR/EXR are tone-mapped (auto exposure +
 ACES) with a live exposure slider, and can be viewed as a mirror sphere or a 360° panorama.
 

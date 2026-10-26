@@ -124,7 +124,7 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
     let ext = extension(path);
     if crate::wic::is_camera_raw(path) {
         // LibRaw first (full sensor bit depth); Windows' Raw Image Decoder for what it can't read.
-        let raw = std::fs::read(path).map_err(|e| e.to_string()).and_then(|bytes| decode_raw(&bytes, max_side, animate));
+        let raw = raw_bytes(path).and_then(|bytes| decode_raw(&bytes, max_side, animate));
         return raw.or_else(|e| from_wic(path, max_side, animate).map_err(|_| codec_hint(&ext, e)));
     }
     if crate::wic::handles(path) {
@@ -476,6 +476,12 @@ fn decode_psd(bytes: &[u8]) -> Result<Decoded, String> {
     Ok(Decoded { bit_depth: Some(BitDepth { bits, float: bits == 32 }), ..Decoded::still(image, opaque) })
 }
 
+/// A RAW file's bytes for LibRaw: GoPro GPRs are converted to plain DNGs first.
+fn raw_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if extension(path) == "gpr" { crate::gpr::to_dng(&bytes) } else { Ok(bytes) }
+}
+
 /// Camera RAW through LibRaw. Viewer images are developed from the sensor data to linear 16-bit;
 /// thumbnails use the camera's embedded preview when it is big enough, else a fast half-size
 /// develop.
@@ -526,6 +532,10 @@ fn decode_raw(bytes: &[u8], max_side: u32, full: bool) -> Result<Decoded, String
 /// A camera RAW's embedded preview at up to `max_side`, with the RAW's real size and metadata:
 /// shown in the viewer while the full develop runs. `None` if there is no usable preview.
 pub fn raw_preview_file(path: &Path, max_side: u32) -> Option<Decoded> {
+    // A GPR has to be fully decoded to read even its preview, so there's nothing to gain.
+    if extension(path) == "gpr" {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     let raw = crate::libraw::Raw::open(&bytes).ok()?;
     let meta = raw.metadata();
@@ -783,7 +793,7 @@ mod raw_survey {
         for f in &files {
             if let Some(out) = std::env::var_os("CYCLOPS_RAW_COMPARE") {
                 // Developed image and embedded preview side by side, for checking colour/orientation.
-                let bytes = std::fs::read(f).unwrap();
+                let Ok(bytes) = super::raw_bytes(f) else { continue };
                 let (Ok(dev), Ok(pre)) = (super::decode_raw(&bytes, 16384, true), super::decode_raw(&bytes, 640, false)) else { continue };
                 let dev = super::fit_within(dev.image, 640);
                 let pre = super::fit_within(pre.image, 640);
@@ -796,7 +806,11 @@ mod raw_survey {
                 continue;
             }
             if std::env::var_os("CYCLOPS_RAW_LIBRAW").is_some() {
-                let bytes = std::fs::read(f).unwrap();
+                let Ok(bytes) = super::raw_bytes(f) else {
+                    failed += 1;
+                    println!("FAIL conversion  {}", f.display());
+                    continue;
+                };
                 let t = Instant::now();
                 let thumb = super::decode_raw(&bytes, 512, false);
                 let thumb_ms = t.elapsed().as_secs_f64() * 1e3;
