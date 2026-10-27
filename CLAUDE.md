@@ -14,6 +14,8 @@ support (camera RAW, HDR, GPU textures, video). Version and licence live in `Car
   CDDL for LibRaw). No GPL. Record every vendored component in `third_party/README.md` and the
   About page credits.
 - The GitHub repository is private: don't link it from the app.
+- **Every installer rebuild bumps the version** in `Cargo.toml` (patch for fixes, minor for features),
+  then commit it and tag `v<version>` so each installer maps to a commit in git.
 
 ## Building
 

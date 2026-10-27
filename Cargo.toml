@@ -1,6 +1,6 @@
 [package]
 name = "cyclops"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "A blazing-fast, GPU-accelerated image browser with a modern glass UI"
 license = "MIT OR Apache-2.0"
