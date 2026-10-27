@@ -4,6 +4,7 @@ mod about_fx;
 mod app;
 mod basis;
 mod chrome;
+mod clipboard;
 mod decode;
 mod diag;
 mod editor;

@@ -196,6 +196,10 @@ enum FileAction {
     NewFolder(PathBuf),
     /// Open in the external editor.
     Edit(usize),
+    /// Put the file on the clipboard (and, for images, the picture).
+    Copy(PathBuf),
+    /// Put the quoted full path on the clipboard, like Explorer's "Copy as path".
+    CopyPath(PathBuf),
 }
 
 enum Dialog {
@@ -1636,7 +1640,16 @@ impl CyclopsApp {
         if let Some(sel) = self.selected {
             let (delete, rename) = ctx.input(|i| (i.key_pressed(Key::Delete), i.key_pressed(Key::F2)));
             let edit = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::E));
-            if delete {
+            let (copy, copy_path) = ctx.input(|i| {
+                let c = i.modifiers.command && i.key_pressed(Key::C);
+                (c && !i.modifiers.shift, c && i.modifiers.shift)
+            });
+            if copy || copy_path {
+                if let Some(e) = self.entries.get(sel).filter(|e| !fs::is_virtual(&e.path)) {
+                    let path = e.path.clone();
+                    self.pending_action = Some(if copy { FileAction::Copy(path) } else { FileAction::CopyPath(path) });
+                }
+            } else if delete {
                 self.pending_action = Some(FileAction::Delete(sel));
             } else if rename {
                 self.pending_action = Some(FileAction::Rename(sel));
@@ -1930,7 +1943,16 @@ impl CyclopsApp {
         let index = v.index;
         let (delete, rename) = ctx.input(|i| (i.key_pressed(Key::Delete), i.key_pressed(Key::F2)));
         let edit = ctx.input(|i| (i.modifiers.is_none() || i.modifiers.command) && i.key_pressed(Key::E));
-        if delete {
+        let (copy, copy_path) = ctx.input(|i| {
+            let c = i.modifiers.command && i.key_pressed(Key::C);
+            (c && !i.modifiers.shift, c && i.modifiers.shift)
+        });
+        if copy || copy_path {
+            if let Some(e) = self.entries.get(index) {
+                let path = e.path.clone();
+                self.pending_action = Some(if copy { FileAction::Copy(path) } else { FileAction::CopyPath(path) });
+            }
+        } else if delete {
             self.pending_action = Some(FileAction::Delete(index));
         } else if rename {
             self.pending_action = Some(FileAction::Rename(index));
@@ -2670,6 +2692,12 @@ fn file_menu(ui: &mut egui::Ui, edit_label: &str, index: usize, entry: &Entry, i
     if fs::is_virtual(&entry.path) {
         return;
     }
+    if ui.add(egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+        pick(FileAction::Copy(entry.path.clone()), ui);
+    }
+    if ui.add(egui::Button::new("Copy as path").shortcut_text("Ctrl+Shift+C")).clicked() {
+        pick(FileAction::CopyPath(entry.path.clone()), ui);
+    }
     ui.separator();
     if ui.add(egui::Button::new("Rename…").shortcut_text("F2")).clicked() {
         pick(FileAction::Rename(index), ui);
@@ -2694,6 +2722,14 @@ fn folder_menu(ui: &mut egui::Ui, folder: &Path, action: &mut Option<FileAction>
     }
     if ui.button("Show in Explorer").clicked() {
         *action = Some(FileAction::Reveal(folder.to_path_buf()));
+        ui.close();
+    }
+    if !fs::is_virtual(folder) && ui.button("Copy").clicked() {
+        *action = Some(FileAction::Copy(folder.to_path_buf()));
+        ui.close();
+    }
+    if !fs::is_virtual(folder) && ui.button("Copy as path").clicked() {
+        *action = Some(FileAction::CopyPath(folder.to_path_buf()));
         ui.close();
     }
 }
@@ -2722,10 +2758,35 @@ impl CyclopsApp {
                     }
                 }
             }
+            FileAction::Copy(path) => self.copy_to_clipboard(path),
+            FileAction::CopyPath(path) => {
+                self.ctx.copy_text(format!("\"{}\"", path.display()));
+                self.show_toast(&self.ctx.clone(), "Path copied".to_owned());
+            }
             FileAction::NewFolder(parent) => match ops::new_folder(&parent) {
                 Ok(path) => self.folder_created(&parent, path),
                 Err(e) => self.show_toast(&self.ctx.clone(), e),
             },
+        }
+    }
+
+    /// Copy a file or folder like Explorer does. For images the picture follows a moment later
+    /// (it has to be decoded at full size), unless something else was copied in the meantime.
+    fn copy_to_clipboard(&mut self, path: PathBuf) {
+        let ctx = self.ctx.clone();
+        match crate::clipboard::set(&path, None) {
+            Ok(sequence) => {
+                self.show_toast(&ctx, "Copied".to_owned());
+                if path.is_file() && crate::decode::is_image(&path) {
+                    std::thread::spawn(move || {
+                        let Ok(decoded) = crate::decode::decode(&path, 16384, 4096, false) else { return };
+                        if crate::clipboard::sequence() == sequence {
+                            let _ = crate::clipboard::set(&path, Some(&decoded.image));
+                        }
+                    });
+                }
+            }
+            Err(e) => self.show_toast(&ctx, e),
         }
     }
 
