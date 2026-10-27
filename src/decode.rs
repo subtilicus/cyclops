@@ -157,7 +157,7 @@ pub fn decode(path: &Path, max_side: u32, vector_side: u32, animate: bool) -> Re
             return Ok(Decoded { frames, opaque: false, bit_depth: Some(BitDepth::EIGHT), ..Decoded::still(image, false) });
         }
     }
-    let img = match load_unlimited(&bytes) {
+    let img = match load_unlimited(&bytes, &ext) {
         Ok(img) => img,
         // Unusual variants (e.g. exotic TIFF compressions) may still be readable by Windows.
         Err(e) => return from_wic(path, max_side, animate).map_err(|_| e),
@@ -230,8 +230,13 @@ fn from_wic(path: &Path, max_side: u32, want_linear: bool) -> Result<Decoded, St
 
 /// `image::load_from_memory` without the default 512 MB allocation cap: big images are
 /// legitimate here, and they are downscaled right after decoding.
-fn load_unlimited(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+/// Decode with the `image` crate. The format comes from the file's signature, or its extension
+/// for formats without one (TGA has no magic bytes).
+fn load_unlimited(bytes: &[u8], ext: &str) -> Result<image::DynamicImage, String> {
     let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().map_err(|e| e.to_string())?;
+    if reader.format().is_none() {
+        reader.set_format(image::ImageFormat::from_extension(ext).ok_or("unknown image format")?);
+    }
     reader.no_limits();
     reader.decode().map_err(|e| e.to_string())
 }
@@ -443,7 +448,7 @@ fn texture_image(texture: crate::gputex::Texture, max_side: u32, keep_linear: bo
 }
 
 fn decode_hdr(bytes: &[u8], max_side: u32, keep_linear: bool) -> Result<Decoded, String> {
-    from_float(load_unlimited(bytes)?.into_rgba32f(), max_side, keep_linear)
+    from_float(load_unlimited(bytes, "")?.into_rgba32f(), max_side, keep_linear)
 }
 
 /// Scene-linear float pixels: CPU tone-mapped image plus, with `keep_linear`, GPU exposure data.
