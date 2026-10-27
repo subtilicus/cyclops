@@ -103,6 +103,27 @@ struct Settings {
     preview_width: f32,
 }
 
+/// Middle-button autoscroll: the page scrolls toward the pointer, faster the further it is from
+/// where the button went down. Held: stops on release. Clicked without moving: stays on until
+/// the next click or Esc (Chrome's behaviour).
+struct Autoscroll {
+    origin: egui::Pos2,
+    started: f64,
+    sticky: bool,
+    /// The pointer left the dead zone (so a release ends it rather than making it sticky).
+    moved: bool,
+}
+
+impl Autoscroll {
+    const DEAD_ZONE: f32 = 12.0;
+
+    /// Scroll speed in points per second for a pointer `dy` points below the origin.
+    fn speed(dy: f32) -> f32 {
+        let excess = (dy.abs() - Self::DEAD_ZONE).max(0.0);
+        dy.signum() * (excess * 5.0 + excess * excess * 0.02)
+    }
+}
+
 enum Thumb {
     /// Queued for background decoding (not on screen yet).
     Queued,
@@ -476,6 +497,8 @@ pub struct CyclopsApp {
     startup_marks_done: bool,
     grid_cols: usize,
     grid_viewport: Rect,
+    /// Middle-button autoscroll in the grid, like Chrome's.
+    autoscroll: Option<Autoscroll>,
     scroll_to_selected: bool,
 
     viewer: Option<Viewer>,
@@ -620,6 +643,7 @@ impl CyclopsApp {
             sort_desc,
             thumb_size,
             thumbs: HashMap::new(),
+            autoscroll: None,
             thumb_stamps: HashMap::new(),
             prefetch_pending: false,
             frames_drawn: 0,
@@ -1071,6 +1095,77 @@ impl CyclopsApp {
                 }
             }
         }
+    }
+
+    /// Start, run and end middle-button autoscroll over the grid (`area`). Returns how far to
+    /// scroll this frame, in points (positive = down), and draws the origin marker.
+    fn autoscroll_step(&mut self, ctx: &egui::Context, area: Rect) -> f32 {
+        use egui::PointerButton;
+        let (pos, now, dt, middle_down, middle_pressed, middle_released, other_pressed, escape) = ctx.input(|i| {
+            (
+                i.pointer.hover_pos(),
+                i.time,
+                i.stable_dt.min(0.1),
+                i.pointer.button_down(PointerButton::Middle),
+                i.pointer.button_pressed(PointerButton::Middle),
+                i.pointer.button_released(PointerButton::Middle),
+                i.pointer.button_pressed(PointerButton::Primary) || i.pointer.button_pressed(PointerButton::Secondary),
+                i.key_pressed(Key::Escape),
+            )
+        });
+        match &mut self.autoscroll {
+            None => {
+                if middle_pressed && pos.is_some_and(|p| area.contains(p)) && ctx.layer_id_at(pos.unwrap_or_default()).is_none_or(|l| l.order == egui::Order::Background) {
+                    self.autoscroll = Some(Autoscroll { origin: pos.unwrap_or_default(), started: now, sticky: false, moved: false });
+                }
+                return 0.0;
+            }
+            Some(a) => {
+                let end = escape
+                    || other_pressed
+                    || (a.sticky && middle_pressed)
+                    || (!a.sticky && middle_released && (a.moved || now - a.started > 0.3));
+                if end {
+                    self.autoscroll = None;
+                    return 0.0;
+                }
+                if !a.sticky && middle_released {
+                    // A quick click without moving: keep scrolling until the next click.
+                    a.sticky = true;
+                }
+                if !a.sticky && !middle_down {
+                    self.autoscroll = None;
+                    return 0.0;
+                }
+            }
+        }
+        let a = self.autoscroll.as_mut().expect("active");
+        let dy = pos.map_or(0.0, |p| p.y - a.origin.y);
+        if dy.abs() > Autoscroll::DEAD_ZONE {
+            a.moved = true;
+        }
+        let speed = Autoscroll::speed(dy);
+        ctx.set_cursor_icon(if speed > 0.0 {
+            egui::CursorIcon::ResizeSouth
+        } else if speed < 0.0 {
+            egui::CursorIcon::ResizeNorth
+        } else {
+            egui::CursorIcon::AllScroll
+        });
+        // Origin marker: a small disc with up and down chevrons.
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::NULL.with("autoscroll")));
+        let c = a.origin;
+        painter.circle(c, 14.0, Color32::from_black_alpha(150), Stroke::new(1.0, Color32::from_white_alpha(120)));
+        painter.circle_filled(c, 2.0, Color32::WHITE);
+        let chevron = |dir: f32| {
+            let tip = c + vec2(0.0, dir * 9.0);
+            vec![tip + vec2(-4.0, -dir * 4.0), tip, tip + vec2(4.0, -dir * 4.0)]
+        };
+        for dir in [-1.0, 1.0] {
+            painter.add(egui::Shape::line(chevron(dir), Stroke::new(1.6, Color32::WHITE)));
+        }
+        ctx.request_repaint();
+        speed * dt
     }
 
     /// Queue every thumbnail in the folder for background decoding, nearest the view first, up
@@ -1810,11 +1905,16 @@ impl CyclopsApp {
             }
         }
 
+        let scroll = self.autoscroll_step(ui.ctx(), ui.max_rect());
+
         let mut clicked = None;
         let mut activated = None;
         let mut menu_action = None;
         let edit_label = self.edit_label();
         area.show_viewport(ui, |ui, viewport| {
+            if scroll != 0.0 {
+                ui.scroll_with_delta_animation(vec2(0.0, -scroll), egui::style::ScrollAnimation::none());
+            }
             self.grid_viewport = viewport;
             ui.set_min_size(vec2(avail_w, total_h));
             let origin = ui.max_rect().min;
