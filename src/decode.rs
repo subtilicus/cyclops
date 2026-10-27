@@ -1,6 +1,6 @@
-//! Image decoding: zune-jpeg for JPEG, Windows Imaging Component for HEIC/AVIF/JXL/RAW,
-//! resvg for SVG, the `psd` crate for Photoshop composites, and `image` for everything else
-//! (including animated GIF/WebP/APNG).
+//! Image decoding: zune-jpeg (or the GPU) for JPEG, LibRaw for camera RAW, Windows Imaging
+//! Component for HEIC/AVIF/JXL/JXR (and RAW LibRaw can't read), resvg for SVG, the `psd` crate
+//! for Photoshop composites, and `image` for everything else (including animated GIF/WebP/APNG).
 
 use std::io::Cursor;
 use std::path::Path;
