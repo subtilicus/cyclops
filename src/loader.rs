@@ -1,5 +1,9 @@
 //! Background decode workers. Full-size requests always take priority over thumbnails,
 //! and thumbnail jobs from a folder the user has already left are dropped unprocessed.
+//!
+//! Thumbnails for the rest of a folder (not yet on screen) go to a separate pool of
+//! below-normal-priority threads, so they fill in without slowing the UI or the tiles the user
+//! is looking at.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,6 +75,7 @@ pub struct SubImage {
 pub struct Loader {
     full_tx: Sender<Job>,
     thumb_tx: Sender<Job>,
+    prefetch_tx: Sender<Job>,
     done_rx: Receiver<Loaded>,
     generation: Arc<AtomicU64>,
 }
@@ -79,6 +84,7 @@ impl Loader {
     pub fn new(ctx: egui::Context) -> Self {
         let (full_tx, full_rx) = unbounded::<Job>();
         let (thumb_tx, thumb_rx) = unbounded::<Job>();
+        let (prefetch_tx, prefetch_rx) = unbounded::<Job>();
         let (done_tx, done_rx) = unbounded();
         let generation = Arc::new(AtomicU64::new(0));
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(1).max(2);
@@ -91,7 +97,21 @@ impl Loader {
                 .spawn(move || worker(full_rx, thumb_rx, done_tx, generation, ctx))
                 .expect("spawn decode worker");
         }
-        Self { full_tx, thumb_tx, done_rx, generation }
+        // Half the cores fill in the rest of the folder in the background.
+        let prefetchers = (std::thread::available_parallelism().map_or(4, |n| n.get()) / 2).max(1);
+        for i in 0..prefetchers {
+            let (prefetch_rx, done_tx) = (prefetch_rx.clone(), done_tx.clone());
+            let generation = generation.clone();
+            let ctx = ctx.clone();
+            std::thread::Builder::new()
+                .name(format!("cyclops-prefetch-{i}"))
+                .spawn(move || {
+                    lower_priority();
+                    worker(crossbeam_channel::never(), prefetch_rx, done_tx, generation, ctx)
+                })
+                .expect("spawn prefetch worker");
+        }
+        Self { full_tx, thumb_tx, prefetch_tx, done_rx, generation }
     }
 
     /// Invalidate all queued thumbnail jobs (call when switching folders).
@@ -102,6 +122,12 @@ impl Loader {
     pub fn request_thumb(&self, path: PathBuf, max_side: u32) {
         let generation = self.generation.load(Ordering::Relaxed);
         let _ = self.thumb_tx.send(Job { path, kind: Kind::Thumb, generation, max_side, screen_side: 0 });
+    }
+
+    /// A thumbnail that isn't on screen yet: decoded in the background at low priority.
+    pub fn prefetch_thumb(&self, path: PathBuf, max_side: u32) {
+        let generation = self.generation.load(Ordering::Relaxed);
+        let _ = self.prefetch_tx.send(Job { path, kind: Kind::Thumb, generation, max_side, screen_side: 0 });
     }
 
     pub fn request_full(&self, path: PathBuf, max_texture_side: u32, screen_side: u32) {
@@ -116,6 +142,15 @@ impl Loader {
 
     pub fn poll(&self) -> impl Iterator<Item = Loaded> + '_ {
         self.done_rx.try_iter()
+    }
+}
+
+/// Run this thread below normal priority, so background decoding never competes with the UI.
+fn lower_priority() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
 }
 

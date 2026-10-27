@@ -18,7 +18,8 @@ use crate::video::{self, VideoPlayer};
 
 /// Thumbnails are decoded at this size and scaled on the GPU for display.
 const THUMB_DECODE_SIDE: u32 = 320;
-const MAX_LIVE_THUMBS: usize = 3000;
+/// GPU memory the session's thumbnail cache may use (a 320 px thumbnail is ~0.3 MB).
+const THUMB_CACHE_BYTES: usize = 1 << 30;
 const FULL_CACHE: usize = 8;
 /// GPU memory the cached full-size images may use (textures up to 16384 px are ~1 GB each).
 const FULL_CACHE_BYTES: usize = 3 << 30;
@@ -103,6 +104,8 @@ struct Settings {
 }
 
 enum Thumb {
+    /// Queued for background decoding (not on screen yet).
+    Queued,
     Pending,
     Ready { tex: TextureHandle, last_used: u64 },
     Failed,
@@ -462,7 +465,12 @@ pub struct CyclopsApp {
     sort_desc: bool,
 
     thumb_size: f32,
+    /// Thumbnails, kept for the whole session across folders (see `evict_thumbs`).
     thumbs: HashMap<PathBuf, Thumb>,
+    /// Modification time each thumbnail was made from, so changed files get a fresh one.
+    thumb_stamps: HashMap<PathBuf, Option<std::time::SystemTime>>,
+    /// The current folder's remaining thumbnails still need queueing for the background.
+    prefetch_pending: bool,
     /// Frames drawn so far (startup milestones, and opening the GPU JPEG decoder after the first).
     frames_drawn: u32,
     startup_marks_done: bool,
@@ -612,6 +620,8 @@ impl CyclopsApp {
             sort_desc,
             thumb_size,
             thumbs: HashMap::new(),
+            thumb_stamps: HashMap::new(),
+            prefetch_pending: false,
             frames_drawn: 0,
             startup_marks_done: false,
             grid_cols: 1,
@@ -712,7 +722,10 @@ impl CyclopsApp {
             place = fs::parent(&p);
         }
         self.loader.new_generation();
-        self.thumbs.clear();
+        // Finished thumbnails stay cached for the session; ones still queued for the folder being
+        // left are cancelled with their jobs.
+        self.thumbs.retain(|_, t| matches!(t, Thumb::Ready { .. }));
+        self.prefetch_pending = true;
         self.viewer = None;
         self.selected = None;
         let listing = if fs::is_virtual(&folder) {
@@ -723,6 +736,13 @@ impl CyclopsApp {
         match listing {
             Ok(mut entries) => {
                 fs::sort(&mut entries, self.sort_key, self.sort_desc);
+                // Files changed since their thumbnail was made get a new one.
+                for e in &entries {
+                    if self.thumb_stamps.get(&e.path).is_some_and(|stamp| *stamp != e.modified) {
+                        self.thumbs.remove(&e.path);
+                        self.thumb_stamps.remove(&e.path);
+                    }
+                }
                 self.entries = entries;
                 self.list_error = None;
             }
@@ -1053,6 +1073,47 @@ impl CyclopsApp {
         }
     }
 
+    /// Queue every thumbnail in the folder for background decoding, nearest the view first, up
+    /// to what the cache can hold. Runs once per folder, after the visible tiles are requested.
+    fn prefetch_folder_thumbs(&mut self, visible: std::ops::Range<usize>) {
+        if !self.prefetch_pending {
+            return;
+        }
+        self.prefetch_pending = false;
+        let budget = THUMB_CACHE_BYTES / (THUMB_DECODE_SIDE as usize * THUMB_DECODE_SIDE as usize * 3);
+        let n = self.entries.len();
+        let (lo, hi) = (visible.start.min(n), visible.end.min(n));
+        // The range itself first (its off-screen margin rows aren't drawn yet), then alternate
+        // below and above it, so the nearest tiles come first.
+        let mut order: Vec<usize> = (lo..hi).collect();
+        order.reserve(n);
+        let (mut down, mut up) = (hi, lo);
+        while down < n || up > 0 {
+            if down < n {
+                order.push(down);
+                down += 1;
+            }
+            if up > 0 {
+                up -= 1;
+                order.push(up);
+            }
+        }
+        let mut queued = 0;
+        for i in order {
+            if queued >= budget {
+                break;
+            }
+            let entry = &self.entries[i];
+            if entry.is_dir || self.thumbs.contains_key(&entry.path) {
+                continue;
+            }
+            self.loader.prefetch_thumb(entry.path.clone(), THUMB_DECODE_SIDE);
+            self.thumb_stamps.insert(entry.path.clone(), entry.modified);
+            self.thumbs.insert(entry.path.clone(), Thumb::Queued);
+            queued += 1;
+        }
+    }
+
     fn evict_thumbs(&mut self) {
         // Folder icons accumulate while browsing; past a few thousand, keep only the sidebar's
         // special folders (the rest reload on demand from the background icon thread).
@@ -1060,21 +1121,34 @@ impl CyclopsApp {
             let special = &self.special;
             self.shell_icons.retain(|(path, _), _| special.contains(path));
         }
-        let live = self.thumbs.values().filter(|t| matches!(t, Thumb::Ready { .. })).count();
-        if live <= MAX_LIVE_THUMBS {
+        // Thumbnails are cached for the session within a memory budget: when it is exceeded, drop
+        // the least recently shown, other folders' before the current one's, down to 3/4.
+        let bytes_of = |t: &Thumb| match t {
+            Thumb::Ready { tex, .. } => tex.size()[0] * tex.size()[1] * 4,
+            _ => 0,
+        };
+        let total: usize = self.thumbs.values().map(bytes_of).sum();
+        if total <= THUMB_CACHE_BYTES {
             return;
         }
-        let mut ages: Vec<(u64, PathBuf)> = self
+        let here = self.folder.clone();
+        let mut ages: Vec<(bool, u64, PathBuf, usize)> = self
             .thumbs
             .iter()
             .filter_map(|(p, t)| match t {
-                Thumb::Ready { last_used, .. } => Some((*last_used, p.clone())),
+                Thumb::Ready { last_used, .. } => Some((p.parent() == here.as_deref(), *last_used, p.clone(), bytes_of(t))),
                 _ => None,
             })
             .collect();
-        ages.sort_unstable_by_key(|(age, _)| *age);
-        for (_, p) in ages.into_iter().take(live - MAX_LIVE_THUMBS * 3 / 4) {
+        ages.sort_unstable_by_key(|(in_folder, age, _, _)| (*in_folder, *age));
+        let mut over = total - THUMB_CACHE_BYTES * 3 / 4;
+        for (_, _, p, bytes) in ages {
+            if over == 0 {
+                break;
+            }
             self.thumbs.remove(&p);
+            self.thumb_stamps.remove(&p);
+            over = over.saturating_sub(bytes);
         }
     }
 
@@ -1765,6 +1839,7 @@ impl CyclopsApp {
                     self.paint_tile(ui, idx, rect, resp.hovered());
                 }
             }
+            self.prefetch_folder_thumbs(first..last);
         });
         if let Some(i) = clicked {
             self.selected = Some(i);
@@ -1809,10 +1884,13 @@ impl CyclopsApp {
                 None => icons::paint(painter, icon_rect, Icon::Folder, theme::p().accent),
             }
         } else {
-            let state = self.thumbs.entry(entry.path.clone()).or_insert_with(|| {
+            // On screen: decode now, ahead of the background queue (even if already queued there).
+            let state = self.thumbs.entry(entry.path.clone()).or_insert(Thumb::Queued);
+            if matches!(state, Thumb::Queued) {
                 self.loader.request_thumb(entry.path.clone(), THUMB_DECODE_SIDE);
-                Thumb::Pending
-            });
+                self.thumb_stamps.insert(entry.path.clone(), entry.modified);
+                *state = Thumb::Pending;
+            }
             match state {
                 Thumb::Ready { tex, last_used } => {
                     *last_used = self.frame_no;
@@ -1824,7 +1902,7 @@ impl CyclopsApp {
                         video_badge(painter, r.max - vec2(14.0, 14.0), 10.0);
                     }
                 }
-                Thumb::Pending => {
+                Thumb::Pending | Thumb::Queued => {
                     painter.rect_filled(img_area.shrink(img_area.width() * 0.12), CornerRadius::same(6), theme::p().bg.gamma_multiply(0.6));
                 }
                 Thumb::Failed => {
