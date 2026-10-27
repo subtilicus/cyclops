@@ -2,7 +2,7 @@
 
 # Cyclops
 
-**A blazing-fast, GPU-accelerated image browser written in Rust — built to displace FastStone.**
+**A blazing-fast, GPU-accelerated image browser for Windows, written in Rust.**
 
 Cyclops aims to be the image browser you never have to wait for: instant folder opens, zero-stutter
 navigation, and a modern glass-like interface that stays at your display's full refresh rate.
@@ -24,7 +24,7 @@ navigation, and a modern glass-like interface that stays at your display's full 
 - EXIF / metadata panel, histogram
 - Lossless JPEG rotation, batch rename/convert/resize
 - Compare mode (side-by-side, synced zoom)
-- Keyboard-first workflow with FastStone-compatible shortcuts
+- Keyboard-first workflow with familiar shortcuts
 
 ## Architecture (initial sketch)
 

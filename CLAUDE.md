@@ -1,6 +1,6 @@
 # Cyclops — notes for coding agents
 
-Cyclops Image Browser: a Rust image browser/viewer for Windows meant to displace FastStone.
+Cyclops Image Browser: a fast Rust image browser/viewer for Windows.
 GPU-accelerated (eframe/egui 0.37 + wgpu 30 on DX12), glass UI, professional-grade format
 support (camera RAW, HDR, GPU textures, video). Version and licence live in `Cargo.toml`.
 
