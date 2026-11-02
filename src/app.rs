@@ -1312,7 +1312,7 @@ impl CyclopsApp {
                 let resp = ui.add(edit);
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     let typed = self.path_edit.trim();
-                    let p = if typed.eq_ignore_ascii_case("network") { PathBuf::from(shell::NETWORK) } else { PathBuf::from(typed) };
+                    let p = if typed.eq_ignore_ascii_case("network") { PathBuf::from(shell::NETWORK) } else { fs::on_disk_path(typed) };
                     if p.is_dir() || fs::is_virtual(&p) {
                         self.navigate(p);
                     } else if p.is_file() {

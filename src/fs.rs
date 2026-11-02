@@ -171,6 +171,41 @@ fn is_hidden(path: &Path, name: &str) -> bool {
 }
 
 /// Visible subdirectories of `dir`, naturally sorted.
+/// A typed or pasted local path with each component spelled as it is on disk (Windows paths are
+/// case-insensitive, but the folder tree matches paths exactly), separators normalised and
+/// surrounding quotes (Explorer's "Copy as path") removed. Components that can't be found are kept
+/// as typed.
+pub fn on_disk_path(typed: &str) -> PathBuf {
+    use std::path::Component;
+    let typed = typed.trim().trim_matches('"').trim();
+    let path = PathBuf::from(typed);
+    if is_remote(&path) {
+        return path;
+    }
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(p) => {
+                let s = p.as_os_str().to_string_lossy();
+                out.push(if s.len() == 2 && s.ends_with(':') { s.to_ascii_uppercase() } else { s.into_owned() });
+            }
+            Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) => {
+                let wanted = name.to_string_lossy().to_lowercase();
+                let found = std::fs::read_dir(&out).ok().and_then(|rd| {
+                    rd.flatten().map(|e| e.file_name()).find(|n| n.to_string_lossy().to_lowercase() == wanted)
+                });
+                out.push(found.as_deref().unwrap_or(name));
+            }
+        }
+    }
+    out
+}
+
 pub fn subdirs(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut dirs: Vec<PathBuf> = rd
@@ -281,4 +316,19 @@ pub fn human_size(bytes: u64) -> String {
         unit += 1;
     }
     if unit == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[unit]) }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn on_disk_path_fixes_case_and_quotes() {
+        let dir = std::env::temp_dir().join("CyclopsCaseTest").join("SubFolder");
+        std::fs::create_dir_all(&dir).unwrap();
+        let typed = format!("\"{}\"", dir.to_string_lossy().to_lowercase().replace('\\', "/"));
+        assert_eq!(on_disk_path(&typed), on_disk_path(&dir.to_string_lossy()));
+        assert!(on_disk_path(&typed).ends_with(r"CyclopsCaseTest\SubFolder"));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
 }
