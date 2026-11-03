@@ -2380,9 +2380,24 @@ impl CyclopsApp {
         }
         let mut menu_action = None;
         let edit_label = self.edit_label();
-        resp.context_menu(|ui| file_menu(ui, &edit_label, index, &entry, false, &mut menu_action));
+        let mut toggle_fullscreen = false;
+        let fullscreen_label = if self.fullscreen { "Exit full screen" } else { "Full screen" };
+        resp.context_menu(|ui| {
+            ui.set_min_width(200.0);
+            if ui.add(egui::Button::new(fullscreen_label).shortcut_text("F11")).clicked() {
+                toggle_fullscreen = true;
+                ui.close();
+            }
+            ui.separator();
+            file_menu(ui, &edit_label, index, &entry, false, &mut menu_action);
+        });
         if menu_action.is_some() {
             self.pending_action = menu_action;
+        }
+        if toggle_fullscreen {
+            // Same as F11: a fullscreen the user picks stays until they leave it.
+            self.fullscreen_for_viewer = false;
+            self.set_fullscreen(ui.ctx(), !self.fullscreen);
         }
         if !entry.is_video {
             self.exposure_control(ui, rect, &entry.path);
