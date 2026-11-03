@@ -341,7 +341,11 @@ impl ZoomPan {
     ) -> (Rect, f32) {
         let ppp = ctx.pixels_per_point();
         let scale = self.zoom.unwrap_or(fit);
-        let (min_scale, max_scale) = (fit * 0.5, 32.0 / ppp);
+        // A collapsed view (negative rect) or a tiny image (fit above the maximum zoom) must not
+        // invert the clamp ranges below: `clamp` panics when min > max.
+        let fit = fit.max(f32::MIN_POSITIVE);
+        let max_scale = (32.0 / ppp).max(fit);
+        let min_scale = fit * 0.5;
         let now = ctx.input(|i| i.time);
         let start_zoom = |zp: &mut ZoomPan, to: f32, focus: egui::Pos2, to_fit: bool| {
             let chained = zp.anim.is_some();
@@ -402,7 +406,7 @@ impl ZoomPan {
         let size = natural * scale;
         // Allow panning until an image edge reaches the view centre, so any part of the
         // image (corners included) can be centred, but it can never be lost entirely.
-        let max_pan = size / 2.0;
+        let max_pan = (size / 2.0).max(Vec2::ZERO);
         self.pan = self.pan.clamp(-max_pan, max_pan);
         if resp.hovered() {
             ctx.set_cursor_icon(if resp.dragged() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
