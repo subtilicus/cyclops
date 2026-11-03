@@ -211,13 +211,38 @@ impl HdrEdit {
 }
 
 /// A file command picked from a menu or shortcut; applied after the frame's UI is drawn.
+/// Where a rename is edited: like Explorer, in place in the grid or the folder tree; in a dialog
+/// from the viewer and the preview pane, where the name isn't on screen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenameIn {
+    Dialog,
+    Grid,
+    Tree,
+}
+
+/// A name being edited in place (grid tile or tree row).
+struct InlineRename {
+    path: PathBuf,
+    text: String,
+    place: RenameIn,
+    /// Not drawn yet: focus the field and select the name on the first frame it is shown.
+    fresh: bool,
+    started: u64,
+    /// Last frame the field was drawn; one that scrolls away or is hidden is committed.
+    drawn: u64,
+    /// Some(true) = commit, Some(false) = cancel; handled after the frame's UI.
+    done: Option<bool>,
+}
+
 enum FileAction {
     Open(usize),
     Reveal(PathBuf),
-    Rename(usize),
+    Rename(usize, RenameIn),
+    /// Rename a folder from the tree (it need not be in the listing).
+    RenameFolder(PathBuf),
     Delete(usize),
     /// Create a folder inside this one and start renaming it.
-    NewFolder(PathBuf),
+    NewFolder(PathBuf, RenameIn),
     /// Open in the external editor.
     Edit(usize),
     /// Put the file on the clipboard (and, for images, the picture).
@@ -513,6 +538,7 @@ pub struct CyclopsApp {
     fullscreen_for_viewer: bool,
     pending_key_zoom: f32,
     pending_action: Option<FileAction>,
+    inline_rename: Option<InlineRename>,
     /// What's behind glass overlays this frame (set when the viewer/preview draws its image).
     backdrop: Option<crate::glass::Backdrop>,
     /// The settings window, if open, and the page it shows.
@@ -663,6 +689,7 @@ impl CyclopsApp {
             pending_key_zoom: 1.0,
             video: None,
             pending_action: None,
+            inline_rename: None,
             backdrop: None,
             settings_page: None,
             detected_editors: crate::editor::detect(),
@@ -1671,6 +1698,8 @@ impl CyclopsApp {
         let expandable = ui.is_rect_visible(rect).then(|| self.expandable(path)).flatten().unwrap_or(false)
             || self.tree_children.get(path).is_some_and(|c| !c.is_empty());
 
+        let editing = self.inline_rename.as_ref().is_some_and(|r| r.place == RenameIn::Tree && r.path == path);
+        let label_x = chevron.max.x + 4.0 + 16.0 + 7.0;
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
             if is_current {
@@ -1689,10 +1718,16 @@ impl CyclopsApp {
                 let (icon, icon_color) = if depth == 0 { (Icon::Drive, theme::p().text_dim) } else { (Icon::Folder, theme::p().accent) };
                 icons::paint(painter, icon_rect, icon, icon_color);
             }
-            let color = if is_current { theme::p().text_strong } else { theme::p().text };
-            let galley = painter.layout_no_wrap(label.to_owned(), FontId::proportional(13.5), color);
-            let text_pos = pos2(icon_rect.max.x + 7.0, rect.center().y - galley.size().y / 2.0);
-            painter.with_clip_rect(rect).galley(text_pos, galley, color);
+            if !editing {
+                let color = if is_current { theme::p().text_strong } else { theme::p().text };
+                let galley = painter.layout_no_wrap(label.to_owned(), FontId::proportional(13.5), color);
+                let text_pos = pos2(label_x, rect.center().y - galley.size().y / 2.0);
+                painter.with_clip_rect(rect).galley(text_pos, galley, color);
+            }
+        }
+        if editing {
+            let field = Rect::from_min_max(pos2(label_x - 4.0, rect.min.y + 1.0), pos2(rect.max.x - 2.0, rect.max.y - 1.0));
+            self.inline_rename_field(ui, field, 13.5, false);
         }
 
         if expandable && (resp.clicked() && on_chevron || resp.double_clicked()) {
@@ -1708,8 +1743,14 @@ impl CyclopsApp {
         if !fs::is_virtual(path) {
             let mut action = None;
             resp.context_menu(|ui| {
+                ui.set_min_width(160.0);
                 if ui.button("New folder").clicked() {
-                    action = Some(FileAction::NewFolder(path.to_path_buf()));
+                    action = Some(FileAction::NewFolder(path.to_path_buf(), RenameIn::Tree));
+                    ui.close();
+                }
+                // Roots (drives, known folders) aren't renamed from here.
+                if depth > 0 && ui.button("Rename").clicked() {
+                    action = Some(FileAction::RenameFolder(path.to_path_buf()));
                     ui.close();
                 }
                 if ui.button("Show in Explorer").clicked() {
@@ -1717,7 +1758,9 @@ impl CyclopsApp {
                     ui.close();
                 }
             });
-            if action.is_some() {
+            if matches!(action, Some(FileAction::RenameFolder(_))) {
+                self.pending_action = action;
+            } else if action.is_some() {
                 // Create it in the folder that was right-clicked, keeping that branch of the tree.
                 self.tree_root = Some(root.to_path_buf());
                 self.expanded.insert((root.to_path_buf(), path.to_path_buf()));
@@ -1807,7 +1850,7 @@ impl CyclopsApp {
         }
         if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(Key::N)) {
             if let Some(folder) = self.folder.clone().filter(|f| !fs::is_virtual(f)) {
-                self.pending_action = Some(FileAction::NewFolder(folder));
+                self.pending_action = Some(FileAction::NewFolder(folder, RenameIn::Grid));
             }
         }
         if let Some(sel) = self.selected {
@@ -1825,7 +1868,7 @@ impl CyclopsApp {
             } else if delete {
                 self.pending_action = Some(FileAction::Delete(sel));
             } else if rename {
-                self.pending_action = Some(FileAction::Rename(sel));
+                self.pending_action = Some(FileAction::Rename(sel, RenameIn::Grid));
             } else if edit {
                 self.pending_action = Some(FileAction::Edit(sel));
             }
@@ -1935,12 +1978,16 @@ impl CyclopsApp {
                 if resp.clicked() || resp.secondary_clicked() {
                     clicked = Some(idx);
                 }
-                resp.context_menu(|ui| file_menu(ui, &edit_label, idx, &self.entries[idx], true, &mut menu_action));
+                resp.context_menu(|ui| file_menu(ui, &edit_label, idx, &self.entries[idx], true, RenameIn::Grid, &mut menu_action));
                 if resp.double_clicked() {
                     activated = Some(idx);
                 }
                 if ui.is_rect_visible(rect) {
                     self.paint_tile(ui, idx, rect, resp.hovered());
+                }
+                if self.inline_rename.as_ref().is_some_and(|r| r.place == RenameIn::Grid && r.path == self.entries[idx].path) {
+                    let field = Rect::from_min_max(pos2(rect.min.x + 4.0, rect.max.y - 43.0), pos2(rect.max.x - 4.0, rect.max.y - 21.0));
+                    self.inline_rename_field(ui, field, 12.0, true);
                 }
             }
             self.prefetch_folder_thumbs(first..last);
@@ -2015,6 +2062,7 @@ impl CyclopsApp {
             }
         }
 
+        let editing = self.inline_rename.as_ref().is_some_and(|r| r.place == RenameIn::Grid && r.path == entry.path);
         let label_w = rect.width() - 14.0;
         let mut job = LayoutJob::single_section(
             entry.name.clone(),
@@ -2027,7 +2075,9 @@ impl CyclopsApp {
         job.wrap = TextWrapping::truncate_at_width(label_w);
         let galley = painter.layout_job(job);
         let pos = pos2(rect.center().x - galley.size().x / 2.0, rect.max.y - 38.0);
-        painter.galley(pos, galley, theme::p().text_dim);
+        if !editing {
+            painter.galley(pos, galley, theme::p().text_dim);
+        }
         if self.settings.show_dates && !entry.modified_label.is_empty() {
             let color = if selected { theme::p().text } else { theme::p().text_dim.gamma_multiply(0.75) };
             painter.text(
@@ -2137,7 +2187,7 @@ impl CyclopsApp {
         } else if delete {
             self.pending_action = Some(FileAction::Delete(index));
         } else if rename {
-            self.pending_action = Some(FileAction::Rename(index));
+            self.pending_action = Some(FileAction::Rename(index, RenameIn::Dialog));
         } else if edit {
             self.pending_action = Some(FileAction::Edit(index));
         }
@@ -2389,7 +2439,7 @@ impl CyclopsApp {
                 ui.close();
             }
             ui.separator();
-            file_menu(ui, &edit_label, index, &entry, false, &mut menu_action);
+            file_menu(ui, &edit_label, index, &entry, false, RenameIn::Dialog, &mut menu_action);
         });
         if menu_action.is_some() {
             self.pending_action = menu_action;
@@ -2481,7 +2531,7 @@ impl CyclopsApp {
         let resp = ui.interact(img_rect, ui.scope_id().with("preview"), Sense::click_and_drag());
         let mut menu_action = None;
         let edit_label = self.edit_label();
-        resp.context_menu(|ui| file_menu(ui, &edit_label, index, &entry, true, &mut menu_action));
+        resp.context_menu(|ui| file_menu(ui, &edit_label, index, &entry, true, RenameIn::Dialog, &mut menu_action));
         if menu_action.is_some() {
             self.pending_action = menu_action;
         }
@@ -2868,7 +2918,15 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) {
 }
 
 /// The right-click menu for a file or folder.
-fn file_menu(ui: &mut egui::Ui, edit_label: &str, index: usize, entry: &Entry, include_open: bool, action: &mut Option<FileAction>) {
+fn file_menu(
+    ui: &mut egui::Ui,
+    edit_label: &str,
+    index: usize,
+    entry: &Entry,
+    include_open: bool,
+    rename_in: RenameIn,
+    action: &mut Option<FileAction>,
+) {
     // In the browser plain letters find files, so editing is Ctrl+E there; the viewer takes E.
     let edit_shortcut = if include_open { "Ctrl+E" } else { "E" };
     let parent = entry.path.parent().map(Path::to_path_buf);
@@ -2897,7 +2955,7 @@ fn file_menu(ui: &mut egui::Ui, edit_label: &str, index: usize, entry: &Entry, i
     }
     ui.separator();
     if ui.add(egui::Button::new("Rename…").shortcut_text("F2")).clicked() {
-        pick(FileAction::Rename(index), ui);
+        pick(FileAction::Rename(index, rename_in), ui);
     }
     if ui.add(egui::Button::new("Delete…").shortcut_text("Del")).clicked() {
         pick(FileAction::Delete(index), ui);
@@ -2905,7 +2963,7 @@ fn file_menu(ui: &mut egui::Ui, edit_label: &str, index: usize, entry: &Entry, i
     if let Some(parent) = parent {
         ui.separator();
         if ui.add(egui::Button::new("New folder").shortcut_text("Ctrl+Shift+N")).clicked() {
-            pick(FileAction::NewFolder(parent), ui);
+            pick(FileAction::NewFolder(parent, rename_in), ui);
         }
     }
 }
@@ -2914,7 +2972,7 @@ fn file_menu(ui: &mut egui::Ui, edit_label: &str, index: usize, entry: &Entry, i
 fn folder_menu(ui: &mut egui::Ui, folder: &Path, action: &mut Option<FileAction>) {
     ui.set_min_width(200.0);
     if ui.add(egui::Button::new("New folder").shortcut_text("Ctrl+Shift+N")).clicked() {
-        *action = Some(FileAction::NewFolder(folder.to_path_buf()));
+        *action = Some(FileAction::NewFolder(folder.to_path_buf(), RenameIn::Grid));
         ui.close();
     }
     if ui.button("Show in Explorer").clicked() {
@@ -2938,9 +2996,15 @@ impl CyclopsApp {
         match action {
             FileAction::Open(i) => self.activate(i),
             FileAction::Reveal(path) => ops::reveal(&path),
-            FileAction::Rename(i) => {
+            FileAction::Rename(i, place) => {
                 if let Some(e) = entry(i) {
-                    self.dialog = Some(Dialog::Rename { path: e.path, text: e.name, error: None, fresh: true });
+                    self.start_rename(e.path, place);
+                }
+            }
+            FileAction::RenameFolder(path) => {
+                // Plain folders only: not shell places, servers or share roots.
+                if !fs::is_virtual(&path) && matches!(fs::location(&path), fs::Location::Local | fs::Location::Remote) {
+                    self.start_rename(path, RenameIn::Tree);
                 }
             }
             FileAction::Delete(i) => {
@@ -2960,8 +3024,8 @@ impl CyclopsApp {
                 self.ctx.copy_text(format!("\"{}\"", path.display()));
                 self.show_toast(&self.ctx.clone(), "Path copied".to_owned());
             }
-            FileAction::NewFolder(parent) => match ops::new_folder(&parent) {
-                Ok(path) => self.folder_created(&parent, path),
+            FileAction::NewFolder(parent, place) => match ops::new_folder(&parent) {
+                Ok(path) => self.folder_created(&parent, path, place),
                 Err(e) => self.show_toast(&self.ctx.clone(), e),
             },
         }
@@ -3015,21 +3079,9 @@ impl CyclopsApp {
                     ui.add_space(6.0);
                     let output = egui::TextEdit::singleline(text).desired_width(f32::INFINITY).margin(vec2(8.0, 6.0)).show(ui);
                     if *fresh {
-                        // Focus the field with the name (not the extension) selected, like Explorer.
                         *fresh = false;
                         output.response.response.request_focus();
-                        let total = text.chars().count();
-                        let stem = if path.is_dir() {
-                            total
-                        } else {
-                            Path::new(text.as_str()).file_stem().map_or(total, |s| s.to_string_lossy().chars().count())
-                        };
-                        let mut state = output.state;
-                        state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                            egui::text::CCursor::new(0),
-                            egui::text::CCursor::new(stem),
-                        )));
-                        state.store(ui.ctx(), output.response.response.id);
+                        select_name_stem(ui.ctx(), output.state, output.response.response.id, text, path.is_dir());
                     }
                     if let Some(e) = error {
                         ui.add_space(4.0);
@@ -3068,7 +3120,7 @@ impl CyclopsApp {
             Some(Dialog::Rename { path, text, .. }) => {
                 self.release_file(&path);
                 match ops::rename(&path, &text) {
-                    Ok(new_path) => self.renamed_entry(&path, new_path),
+                    Ok(new_path) => self.renamed_path(&path, new_path),
                     Err(e) => {
                         self.dialog = Some(Dialog::Rename { path, text, error: Some(e), fresh: false });
                     }
@@ -3134,8 +3186,8 @@ impl CyclopsApp {
         self.scroll_to_selected = true;
     }
 
-    /// Show a just-created folder (in the grid and tree) and open the rename box for it.
-    fn folder_created(&mut self, parent: &Path, path: PathBuf) {
+    /// Show a just-created folder (in the grid and tree) and start renaming it.
+    fn folder_created(&mut self, parent: &Path, path: PathBuf, place: RenameIn) {
         self.tree_children.remove(parent);
         self.has_subdirs.remove(parent);
         if let Some(root) = self.tree_root.clone() {
@@ -3156,8 +3208,114 @@ impl CyclopsApp {
             self.selected = self.entries.iter().position(|e| e.path == path);
             self.scroll_to_selected = true;
         }
+        // The grid can only edit it if it's in the folder on show.
+        let place = if place == RenameIn::Grid && self.folder.as_deref() != Some(parent) { RenameIn::Dialog } else { place };
+        self.start_rename(path, place);
+    }
+
+    fn start_rename(&mut self, path: PathBuf, place: RenameIn) {
         let text = fs::file_name(&path);
-        self.dialog = Some(Dialog::Rename { path, text, error: None, fresh: true });
+        if place == RenameIn::Dialog {
+            self.dialog = Some(Dialog::Rename { path, text, error: None, fresh: true });
+            return;
+        }
+        if place == RenameIn::Grid {
+            if let Some(i) = self.entries.iter().position(|e| e.path == path) {
+                self.selected = Some(i);
+                self.scroll_to_selected = true;
+            }
+        }
+        let now = self.frame_no;
+        self.inline_rename = Some(InlineRename { path, text, place, fresh: true, started: now, drawn: now, done: None });
+    }
+
+    /// The in-place name editor, drawn over a grid tile's or tree row's label. Enter or clicking
+    /// elsewhere commits (like Explorer), Esc cancels.
+    fn inline_rename_field(&mut self, ui: &mut egui::Ui, rect: Rect, font_size: f32, centered: bool) {
+        let frame_no = self.frame_no;
+        let Some(r) = self.inline_rename.as_mut() else { return };
+        if r.done.is_some() {
+            return;
+        }
+        r.drawn = frame_no;
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        let mut edit = egui::TextEdit::singleline(&mut r.text)
+            .id_salt("cyclops-inline-rename")
+            .font(FontId::proportional(font_size))
+            .desired_width(rect.width())
+            .margin(vec2(4.0, 2.0));
+        if centered {
+            edit = edit.align(Align2::CENTER_CENTER);
+        }
+        let output = edit.show(&mut child);
+        let resp = &output.response.response;
+        if r.fresh {
+            r.fresh = false;
+            resp.request_focus();
+            resp.scroll_to_me(None);
+            select_name_stem(ui.ctx(), output.state, resp.id, &r.text, r.path.is_dir());
+            return;
+        }
+        // egui's own focus, not `has_focus()`: that is also false while the window is in the
+        // background, and alt-tabbing away mustn't end the rename.
+        if !ui.memory(|m| m.has_focus(resp.id)) {
+            let cancel = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+            ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+            r.done = Some(!cancel);
+        }
+    }
+
+    /// Finish an in-place rename: commit or cancel it once it's done, and commit one whose field
+    /// is no longer on screen (scrolled away, folder left, viewer opened).
+    fn finish_inline_rename(&mut self) {
+        let Some(r) = self.inline_rename.as_ref() else { return };
+        let done = match r.done {
+            Some(d) => d,
+            // Never shown (e.g. its tree branch is collapsed): give up after a few frames.
+            None if r.fresh => {
+                if self.frame_no > r.started + 10 {
+                    self.inline_rename = None;
+                }
+                return;
+            }
+            None if r.drawn + 1 < self.frame_no => true,
+            None => return,
+        };
+        let Some(r) = self.inline_rename.take() else { return };
+        if !done || r.text.trim().is_empty() || r.text == fs::file_name(&r.path) {
+            return;
+        }
+        self.release_file(&r.path);
+        match ops::rename(&r.path, &r.text) {
+            Ok(new_path) => self.renamed_path(&r.path, new_path),
+            Err(e) => {
+                // Like Explorer: say why and keep editing.
+                self.show_toast(&self.ctx.clone(), e);
+                let now = self.frame_no;
+                self.inline_rename = Some(InlineRename { fresh: true, started: now, drawn: now, done: None, ..r });
+            }
+        }
+    }
+
+    /// A file or folder was renamed: update the listing, and for folders the tree, the current
+    /// folder and history if they were inside it.
+    fn renamed_path(&mut self, old: &Path, new: PathBuf) {
+        self.renamed_entry(old, new.clone());
+        if !new.is_dir() {
+            return;
+        }
+        let moved = |p: &Path| p.strip_prefix(old).ok().map(|rest| if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) });
+        self.expanded = self.expanded.drain().map(|(root, p)| { let p = moved(&p).unwrap_or(p); (root, p) }).collect();
+        self.tree_children.retain(|p, _| !p.starts_with(old));
+        self.has_subdirs.retain(|p, _| !p.starts_with(old));
+        for h in &mut self.history {
+            if let Some(p) = moved(h) {
+                *h = p;
+            }
+        }
+        if let Some(folder) = self.folder.as_deref().and_then(moved) {
+            self.load_folder(folder);
+        }
     }
 
     /// The window size/position is restored from last time, which may have been on a bigger or
@@ -3451,6 +3609,16 @@ impl CyclopsApp {
 }
 
 /// Whether `folder` lives in the tree branch below `root`.
+/// Select the name without its extension (all of it for folders), like Explorer's rename.
+fn select_name_stem(ctx: &egui::Context, mut state: egui::text_edit::TextEditState, id: egui::Id, text: &str, is_dir: bool) {
+    let total = text.chars().count();
+    let stem = if is_dir { total } else { Path::new(text).file_stem().map_or(total, |s| s.to_string_lossy().chars().count()) };
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(stem))));
+    state.store(ctx, id);
+}
+
 fn under_root(folder: &Path, root: &Path) -> bool {
     if fs::location(root) == fs::Location::Network {
         fs::is_remote(folder)
@@ -3504,7 +3672,11 @@ impl eframe::App for CyclopsApp {
         if fullscreen_key {
             self.fullscreen_for_viewer = false;
             self.set_fullscreen(&ctx, !self.fullscreen);
-        } else if self.fullscreen && self.viewer.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+        } else if self.fullscreen
+            && self.viewer.is_none()
+            && !ctx.egui_wants_keyboard_input()
+            && ctx.input(|i| i.key_pressed(Key::Escape))
+        {
             self.set_fullscreen(&ctx, false);
         }
         // While a dialog is open it owns the keyboard (Enter/Esc/Del must not reach the views).
@@ -3567,6 +3739,7 @@ impl eframe::App for CyclopsApp {
                 self.preview_divider(ui, panel);
             }
         }
+        self.finish_inline_rename();
         self.apply_pending_action();
         self.dialogs(&ctx);
         self.settings_window(&ctx);
